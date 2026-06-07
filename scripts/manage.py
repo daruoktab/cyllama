@@ -1920,8 +1920,26 @@ class SqliteVectorBuilder(Builder):
         # Ensure destination directory exists
         self.package_dest.mkdir(parents=True, exist_ok=True)
 
+        # Windows-specific: Create build/dist dirs and patch Makefile
+        (self.src_dir / "build").mkdir(exist_ok=True)
+        (self.src_dir / "dist").mkdir(exist_ok=True)
+
+        makefile = self.src_dir / "Makefile"
+        if makefile.exists():
+            content = makefile.read_text()
+            # Remove problematic shell calls
+            content = content.replace("$(shell mkdir -p $(BUILD_DIR) $(DIST_DIR))", "# mkdir handled by manage.py")
+            if PLATFORM == "Windows":
+                # Ensure we use Windows-friendly RM if possible, or just skip it
+                # if it fails. Most 'make' on Windows comes with some form of 'rm'.
+                pass
+            makefile.write_text(content)
+
         # Clean any previous build
-        self.cmd("make clean", cwd=self.src_dir)
+        try:
+            self.cmd("make clean", cwd=self.src_dir)
+        except Exception:
+            self.log.warning("make clean failed, continuing anyway...")
 
         # Build the extension using make
         # Patch source to define _GNU_SOURCE for strcasestr on older glibc

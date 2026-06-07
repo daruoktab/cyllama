@@ -1,3 +1,12 @@
+# Windows: register CUDA toolkit DLL directories before any native extension
+# (e.g. llama_cpp.pyd) is imported via api / batching / memory.
+import sys as _cy_sys
+
+if _cy_sys.platform == "win32":
+    from .utils.platform import ensure_native_deps as _ensure_native_deps
+
+    _ensure_native_deps()
+
 from .defaults import (  # noqa: F401
     LLAMA_DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
