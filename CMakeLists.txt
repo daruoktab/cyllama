@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.26...3.30)
+
+# Workaround MSBuild 17.14.40 VCTargetsPath detection bug
+if(WIN32 AND "$ENV{VCTargetsPath}" STREQUAL "")
+  set(ENV{VCTargetsPath} "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/MSBuild/Microsoft/VC/v170\\")
+endif()
+
 project(cyllama LANGUAGES C CXX)
 
 # -----------------------------------------------------------------------------
