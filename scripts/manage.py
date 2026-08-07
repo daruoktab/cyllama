@@ -137,18 +137,18 @@ PLATFORM = platform.system()
 ARCH = platform.machine()
 PY_VER_MINOR = sys.version_info.minor
 
-STABLE_BUILD = getenv("STABLE_BUILD", False)
+STABLE_BUILD = getenv("STABLE_BUILD", True)
 if STABLE_BUILD:
     # known to build and work without errors, 100% tests pass
-    LLAMACPP_VERSION = "b9505"
-    WHISPERCPP_VERSION = "v1.8.4"
-    SDCPP_VERSION = "master-672-1f9ee88"
+    LLAMACPP_VERSION = "b10271"
+    WHISPERCPP_VERSION = "v1.9.2"
+    SDCPP_VERSION = "master-812-ea7f0c8"
     SQLITEVECTOR_VERSION = "1.0.0"
 else:
     # experimental bleeding-edge builds ` = ""` means get latest
-    LLAMACPP_VERSION = "b9628"
-    WHISPERCPP_VERSION = "v1.8.6"
-    SDCPP_VERSION = "master-694-276025e"
+    LLAMACPP_VERSION = "b10271"
+    WHISPERCPP_VERSION = "v1.9.2"
+    SDCPP_VERSION = "master-812-ea7f0c8"
     SQLITEVECTOR_VERSION = "1.0.0"
 if PLATFORM == "Darwin":
     MACOSX_DEPLOYMENT_TARGET = setenv("MACOSX_DEPLOYMENT_TARGET", "12.6")
@@ -918,6 +918,76 @@ class AbstractBuilder(ShellCmd):
         """Dynamic lib paths that are absent from `self.dynamic_lib`."""
         return [p for p in self.dynamic_libs if not p.exists()]
 
+    @property
+    def version_stamp(self) -> Path:
+        """Path of the file recording which pinned version `src_dir` holds."""
+        return self.src_dir / ".cyllama-version"
+
+    def checked_out_version(self) -> Optional[str]:
+        """Return the pinned version the existing `src_dir` was fetched at.
+
+        Prefers the stamp written by `ensure_source`, which is exact and works
+        for any provenance. Falls back to `git describe --tags` for checkouts
+        made before stamping existed -- for every project pinned here that
+        returns the pin string verbatim (`b10107`, `v1.9.1`,
+        `master-795-87a0177`, `1.0.0`). Returns None when neither is available,
+        which `ensure_source` treats as unknown-and-therefore-stale.
+        """
+        if self.version_stamp.exists():
+            return self.version_stamp.read_text().strip() or None
+        if not (self.src_dir / ".git").exists():
+            return None
+        try:
+            return self.get("git describe --tags", cwd=self.src_dir).strip() or None
+        except Exception:
+            return None
+
+    def ensure_source(self) -> None:
+        """Guarantee `src_dir` holds the *pinned* source, re-fetching if not.
+
+        Build entry points used to do `if not self.src_dir.exists(): setup()`,
+        which reuses whatever revision a previous build left behind. When a
+        version pin moves, that stale tree is not just built -- `_copy_headers`
+        installs its older headers over the git-tracked `thirdparty/*/include/`
+        trees, silently reverting them and breaking compilation of bindings
+        written against the new pin. The failure surfaces far from its cause
+        (a link error, or `no member named ...` deep in generated C++), and the
+        build still exits 0.
+
+        Comparing the checked-out version against the pin makes that
+        impossible: a mismatch removes the tree and re-clones at the pin.
+        """
+        if not self.src_dir.exists():
+            self.setup()
+            self._write_version_stamp()
+            return
+
+        if not self.version:
+            return  # unpinned ("track latest"); nothing to compare against
+
+        current = self.checked_out_version()
+        if current == self.version:
+            return
+
+        self.log.warning(
+            "%s source in %s is at %s but the pin is %s -- re-cloning "
+            "(a stale checkout would install its older headers over "
+            "thirdparty/%s/include/)",
+            self.name,
+            self.src_dir,
+            current or "an unknown revision",
+            self.version,
+            self.name,
+        )
+        self.remove(self.src_dir)
+        self.setup()
+        self._write_version_stamp()
+
+    def _write_version_stamp(self) -> None:
+        """Record the pin `src_dir` was fetched at, for `checked_out_version`."""
+        if self.version and self.src_dir.exists():
+            self.version_stamp.write_text(f"{self.version}\n")
+
     def pre_process(self) -> None:
         """override by subclass if needed"""
 
@@ -1073,6 +1143,53 @@ class GgmlBuilder(Builder):
             options["GGML_OPENMP"] = "ON" if openmp == "1" else "OFF"
             self.log.info(f"  GGML_OPENMP={options['GGML_OPENMP']}")
 
+    def _apply_source_patches(self) -> None:
+        """Apply local fixes to the vendored source before building.
+
+        Two sets of ``scripts/patches/*.patch`` files are applied (with ``-p1``,
+        a/ b/ prefixes) to the cloned source tree: ``ggml-*.patch``, which fix
+        the ggml copy that every ggml-backed project vendors, and
+        ``<project>-*.patch`` (e.g. ``llama.cpp-*.patch``), which are specific
+        to one upstream. The tree is wiped and re-fetched by ``make
+        reset``/``remake`` -- so these must run on every build. Each patch is
+        applied idempotently and is self-disabling: if it is already applied,
+        or no longer applies (e.g. upstream merged an equivalent fix or
+        refactored the context), it is skipped as a no-op. The ``.patch`` files
+        are the single source of truth and double as the upstream PR payload;
+        see scripts/patches/README.md for the rationale and upstream refs.
+        """
+        patch_dir = Path(__file__).resolve().parent / "patches"
+        patches = sorted(patch_dir.glob("ggml-*.patch")) + sorted(patch_dir.glob(f"{self.name}-*.patch"))
+        for patch in patches:
+            self._apply_patch(patch)
+
+    def _apply_patch(self, patch: Path) -> None:
+        """Apply a single unified diff to ``self.src_dir`` if it isn't already.
+
+        Uses ``git apply`` (which works with or without a git repo) and its
+        ``--check`` / ``--reverse --check`` dry-runs to decide between apply,
+        already-applied, and no-longer-applies -- without aborting the build in
+        the latter two cases (unlike ``self.cmd``).
+        """
+
+        def _git_apply(*flags: str) -> bool:
+            return (
+                subprocess.run(
+                    ["git", "apply", *flags, str(patch)],
+                    cwd=str(self.src_dir),
+                    capture_output=True,
+                ).returncode
+                == 0
+            )
+
+        if _git_apply("--check"):
+            subprocess.run(["git", "apply", str(patch)], cwd=str(self.src_dir), check=True)
+            self.log.info(f"applied patch: {patch.name}")
+        elif _git_apply("--reverse", "--check"):
+            self.log.debug(f"patch already applied, skipping: {patch.name}")
+        else:
+            self.log.info(f"patch no longer applies, skipping: {patch.name}")
+
 
 class LlamaCppBuilder(GgmlBuilder):
     """build llama.cpp"""
@@ -1083,7 +1200,9 @@ class LlamaCppBuilder(GgmlBuilder):
     # llama.cpp installs ggml as a split build: the unified `ggml` plus
     # the `ggml-base` / `ggml-cpu` partials.
     base_libs: list[str] = ["ggml", "ggml-base", "ggml-cpu"]
-    extra_libs: list[str] = ["llama", "llama-common", "mtmd"]
+    # `llama-common` is deliberately absent: nothing in cyllama links it. See
+    # the note above the target list in `build()`.
+    extra_libs: list[str] = ["llama", "mtmd"]
 
     def get_backend_cmake_options(self) -> dict[str, Any]:
         """CMake options for llama.cpp (GGML_* flag names)."""
@@ -1164,54 +1283,9 @@ class LlamaCppBuilder(GgmlBuilder):
         # mtmd (multimodal) headers.
         self.glob_copy(self.src_dir / "tools" / "mtmd", self.include, patterns=["*.h"])
 
-    def _apply_source_patches(self) -> None:
-        """Apply local fixes to the vendored llama.cpp source before building.
-
-        Every ``scripts/patches/llama.cpp-*.patch`` file is applied (with ``-p1``,
-        a/ b/ prefixes) to the cloned source tree, which is wiped and re-fetched
-        by ``make reset``/``remake`` -- so these must run on every build. Each
-        patch is applied idempotently and is self-disabling: if it is already
-        applied, or no longer applies (e.g. upstream merged an equivalent fix or
-        refactored the context), it is skipped as a no-op. The ``.patch`` files
-        are the single source of truth and double as the upstream PR payload;
-        see scripts/patches/README.md for the rationale and upstream refs.
-        """
-        patch_dir = Path(__file__).resolve().parent / "patches"
-        patches = sorted(patch_dir.glob("llama.cpp-*.patch"))
-        for patch in patches:
-            self._apply_patch(patch)
-
-    def _apply_patch(self, patch: Path) -> None:
-        """Apply a single unified diff to ``self.src_dir`` if it isn't already.
-
-        Uses ``git apply`` (which works with or without a git repo) and its
-        ``--check`` / ``--reverse --check`` dry-runs to decide between apply,
-        already-applied, and no-longer-applies -- without aborting the build in
-        the latter two cases (unlike ``self.cmd``).
-        """
-
-        def _git_apply(*flags: str) -> bool:
-            return (
-                subprocess.run(
-                    ["git", "apply", *flags, str(patch)],
-                    cwd=str(self.src_dir),
-                    capture_output=True,
-                ).returncode
-                == 0
-            )
-
-        if _git_apply("--check"):
-            subprocess.run(["git", "apply", str(patch)], cwd=str(self.src_dir), check=True)
-            self.log.info(f"applied patch: {patch.name}")
-        elif _git_apply("--reverse", "--check"):
-            self.log.debug(f"patch already applied, skipping: {patch.name}")
-        else:
-            self.log.info(f"patch no longer applies, skipping: {patch.name}")
-
     def build(self, shared: bool = False) -> None:
         """main build function"""
-        if not self.src_dir.exists():
-            self.setup()
+        self.ensure_source()
         self.log.info(f"building {self.name}")
         self.prefix.mkdir(exist_ok=True)
         self.include.mkdir(exist_ok=True)
@@ -1239,7 +1313,7 @@ class LlamaCppBuilder(GgmlBuilder):
             CMAKE_C_VISIBILITY_PRESET="hidden",
             CMAKE_VISIBILITY_INLINES_HIDDEN=True,
             LLAMA_CURL=False,
-            LLAMA_OPENSSL=True,  # Enable OpenSSL in cpp-httplib for HTTPS support
+            LLAMA_OPENSSL=False,  # cpp-httplib is not linked into cyllama (see CMakeLists.txt), so no SSL needed
             LLAMA_BUILD_SERVER=False,  # Server requires httplib
             LLAMA_BUILD_TESTS=False,  # Tests require httplib
             LLAMA_BUILD_EXAMPLES=False,  # Don't need examples
@@ -1247,16 +1321,23 @@ class LlamaCppBuilder(GgmlBuilder):
             **backend_options,
         )
         # Build specific targets to avoid httplib-dependent tools like llama-run
-        # We need: llama, ggml, llama-common, mtmd
-        # (upstream b8833 renamed the `common` target -> `llama-common`)
-        self.cmake_build_targets(build_dir=self.build_dir, targets=["llama", "llama-common", "mtmd"], release=True)
+        # We need: llama, ggml, mtmd (ggml comes along as a dependency).
+        #
+        # `llama-common` (upstream renamed the `common` target in b8833) is
+        # deliberately not built. No cyllama extension references it — the
+        # link lists in CMakeLists.txt name only llama/mtmd/ggml, and mtmd
+        # links just ggml+llama (upstream even errors if mtmd picks up
+        # llama-common). It is the single most expensive target in the tree
+        # (chat.cpp, the jinja and PEG parsers, arg.cpp, download.cpp) and
+        # produced an 8 MB .a that was only ever copied, never linked.
+        self.cmake_build_targets(build_dir=self.build_dir, targets=["llama", "mtmd"], release=True)
 
         # Manually copy required libraries instead of cmake install (which tries to install all components)
         self.lib.mkdir(parents=True, exist_ok=True)
 
         # Copy core libraries from build directory (platform-aware)
-        self.copy_lib(self.build_dir, "common", "llama-common", self.lib)
-        self.copy_lib(self.build_dir, "vendor/cpp-httplib", "cpp-httplib", self.lib, required=False)
+        # Note: cpp-httplib is intentionally not copied — cyllama does not link it
+        # (see CMakeLists.txt); it only pulled in OpenSSL SSLClient symbols.
         self.copy_lib(self.build_dir, "src", "llama", self.lib)
         self.copy_lib(self.build_dir, "ggml/src", "ggml", self.lib)
         self.copy_lib(self.build_dir, "ggml/src", "ggml-base", self.lib)
@@ -1275,8 +1356,7 @@ class LlamaCppBuilder(GgmlBuilder):
         """
         # Run the cmake configure + build steps (headers + cmake config + cmake build)
         # but skip the copy_lib steps which look for .a files.
-        if not self.src_dir.exists():
-            self.setup()
+        self.ensure_source()
         self.log.info(f"building {self.name} (shared)")
         self.prefix.mkdir(exist_ok=True)
         self.include.mkdir(exist_ok=True)
@@ -1312,7 +1392,7 @@ class LlamaCppBuilder(GgmlBuilder):
             GGML_BACKEND_DL=use_backend_dl,
             CMAKE_POSITION_INDEPENDENT_CODE=True,
             LLAMA_CURL=False,
-            LLAMA_OPENSSL=True,
+            LLAMA_OPENSSL=False,  # cpp-httplib is not linked into cyllama (see CMakeLists.txt), so no SSL needed
             LLAMA_BUILD_SERVER=False,
             LLAMA_BUILD_TESTS=False,
             LLAMA_BUILD_EXAMPLES=False,
@@ -1322,7 +1402,7 @@ class LlamaCppBuilder(GgmlBuilder):
         # With GGML_BACKEND_DL=True, backends are separate plugin targets
         # that are not transitive dependencies of llama.  Build them explicitly.
         # ggml-cpu is always needed; GPU backends are conditional.
-        targets = ["llama", "llama-common", "mtmd", "ggml-cpu"]
+        targets = ["llama", "mtmd", "ggml-cpu"]  # no llama-common; see build()
         targets.extend(f"ggml-{short}" for short in self.enabled_backends_from_options(backend_options))
         self.cmake_build_targets(build_dir=self.build_dir, targets=targets, release=True)
 
@@ -1503,8 +1583,7 @@ class LlamaCppBuilder(GgmlBuilder):
         # Ensure headers exist (source checkout + header copy)
         if not self.include.exists() or not any(self.include.iterdir()):
             self.log.info("Headers not found, running source setup for headers...")
-            if not self.src_dir.exists():
-                self.setup()
+            self.ensure_source()
             # Copy headers only (same as build() header section)
             self.prefix.mkdir(exist_ok=True)
             self.include.mkdir(exist_ok=True)
@@ -1732,12 +1811,12 @@ class WhisperCppBuilder(GgmlBuilder):
 
     def build(self, shared: bool = False) -> None:
         """whisper.cpp main build function"""
-        if not self.src_dir.exists():
-            self.setup()
+        self.ensure_source()
         self.log.info(f"building {self.name}")
         self.prefix.mkdir(exist_ok=True)
         self.include.mkdir(exist_ok=True)
         self.glob_copy(self.src_dir / "examples", self.include, patterns=["*.h", "*.hpp"])
+        self._apply_source_patches()
 
         # Get backend options
         backend_options = self.get_backend_cmake_options()
@@ -1765,21 +1844,27 @@ class StableDiffusionCppBuilder(GgmlBuilder):
     name: str = "stable-diffusion.cpp"
     version: str = SDCPP_VERSION
     repo_url: str = "https://github.com/leejet/stable-diffusion.cpp.git"
-    # SD installs only its own lib; ggml comes from llama.cpp when
-    # SD_USE_VENDORED_GGML=0, otherwise from SD's vendored copy.
+    # SD installs only its own lib; ggml comes from llama.cpp by default,
+    # or from SD's vendored copy when SD_USE_VENDORED_GGML is set to 1.
     base_libs: list[str] = ["stable-diffusion"]
     extra_libs: list[str] = []
 
     # stable-diffusion.cpp requires GGML_MAX_NAME=128 (see its CMakeLists.txt:233
     # and ggml_extend.hpp:94). llama.cpp defaults to 64. When SD shares
-    # llama.cpp's ggml dylibs (SD_USE_VENDORED_GGML=0), both sides must agree on
-    # this value or the ggml_tensor struct layout diverges and tensor copies crash.
+    # llama.cpp's ggml (the default), both sides must agree on this value or the
+    # ggml_tensor struct layout diverges and tensor copies crash.
     GGML_MAX_NAME: int = 128
 
     @staticmethod
     def uses_shared_ggml() -> bool:
-        """Return True when SD is configured to share llama.cpp's ggml."""
-        return os.environ.get("SD_USE_VENDORED_GGML") == "0"
+        """Return True when SD is configured to share llama.cpp's ggml.
+
+        Sharing is the default. Mirrors the resolution order in CMakeLists.txt:
+        ``SD_USE_VENDORED_GGML`` defaults to OFF, and the env var overrides it
+        only when set -- ``0`` keeps sharing, any other value opts back into
+        SD's vendored copy.
+        """
+        return os.environ.get("SD_USE_VENDORED_GGML", "0") == "0"
 
     def get_backend_cmake_options(self) -> dict[str, Any]:
         """CMake options for stable-diffusion.cpp (SD_* flag names, no BLAS)."""
@@ -1833,17 +1918,20 @@ class StableDiffusionCppBuilder(GgmlBuilder):
 
     def build(self, shared: bool = False, examples: bool = True) -> None:
         """stable-diffusion.cpp main build function"""
-        if not self.src_dir.exists():
-            self.setup()
+        self.ensure_source()
         self.log.info(f"building {self.name}")
 
         # Sync ggml ABI from llama.cpp before compiling so that enum
-        # values (ggml_op, ggml_type) match the dylibs we link against.
-        # Only needed when SD links against llama.cpp's shared ggml
-        # (--sd-shared-ggml). By default SD uses its own vendored ggml
-        # statically, so syncing would overwrite the vendored source.
-        if os.environ.get("SD_USE_VENDORED_GGML") == "0":
+        # values (ggml_op, ggml_type) match the libs we link against. This is
+        # the default path; only --sd-vendored-ggml skips it, in which case SD
+        # compiles and links its own vendored copy and syncing would overwrite
+        # that source.
+        if self.uses_shared_ggml():
             self._sync_ggml_abi()
+
+        # after _sync_ggml_abi(), so the ggml patches land on whichever ggml
+        # copy is actually compiled (SD's vendored one or llama.cpp's)
+        self._apply_source_patches()
 
         self.prefix.mkdir(exist_ok=True)
         self.include.mkdir(exist_ok=True)
@@ -1913,8 +2001,7 @@ class SqliteVectorBuilder(Builder):
 
     def build(self, shared: bool = True) -> None:
         """sqlite-vector main build function using make"""
-        if not self.src_dir.exists():
-            self.setup()
+        self.ensure_source()
         self.log.info(f"building {self.name}")
 
         # Ensure destination directory exists
@@ -2693,7 +2780,12 @@ class Application(ShellCmd, metaclass=MetaCommander):
     )
     @option(
         "--sd-shared-ggml",
-        help="link stable-diffusion against llama.cpp's shared ggml instead of its own vendored copy",
+        help="link stable-diffusion against llama.cpp's ggml (default; kept for explicitness)",
+        action="store_true",
+    )
+    @option(
+        "--sd-vendored-ggml",
+        help="link stable-diffusion against its own vendored ggml instead of llama.cpp's",
         action="store_true",
     )
     @option(
@@ -2746,7 +2838,9 @@ class Application(ShellCmd, metaclass=MetaCommander):
         if args.cpu_all_variants:
             os.environ["GGML_CPU_ALL_VARIANTS"] = "1"
 
-        if args.sd_shared_ggml:
+        if args.sd_vendored_ggml:
+            os.environ["SD_USE_VENDORED_GGML"] = "1"
+        elif args.sd_shared_ggml:
             os.environ["SD_USE_VENDORED_GGML"] = "0"
 
         # Map builder classes to their version arguments
@@ -2790,9 +2884,9 @@ class Application(ShellCmd, metaclass=MetaCommander):
                 if asset is None or StableDiffusionCppBuilder.uses_shared_ggml():
                     if asset is not None:
                         self.log.info(
-                            "SD_USE_VENDORED_GGML=0: building llama.cpp from "
-                            "source to propagate GGML_MAX_NAME=128 (skipping "
-                            "upstream pre-built release)"
+                            "SD shares llama.cpp's ggml: building llama.cpp "
+                            "from source to propagate GGML_MAX_NAME=128 "
+                            "(skipping upstream pre-built release)"
                         )
                     else:
                         self.log.warning(
@@ -2856,7 +2950,7 @@ class Application(ShellCmd, metaclass=MetaCommander):
         # shares the same version as llama.cpp's.
         if not llama_ggml_version:
             llama_ggml_version = ggml_versions.get(WhisperCppBuilder)
-        sd_uses_vendored_ggml = os.environ.get("SD_USE_VENDORED_GGML") == "1"
+        sd_uses_vendored_ggml = not StableDiffusionCppBuilder.uses_shared_ggml()
 
         for BuilderClass, version in builder_versions.items():
             name = BuilderClass.name.replace(".", "_").replace("-", "_")
@@ -3125,12 +3219,67 @@ class Application(ShellCmd, metaclass=MetaCommander):
     # ------------------------------------------------------------------------
     # check_vendor
 
+    # Source subdirectories searched, per project, when verifying that a
+    # committed header still matches upstream. These mirror where each
+    # builder's header-install step takes files from, and were chosen so that
+    # every committed header resolves to exactly one candidate -- a bare
+    # recursive search by filename is ambiguous (whisper.cpp has four
+    # `common.h` files in its tree).
+    _VENDOR_HEADER_ROOTS: dict[str, list[str]] = {
+        "whisper.cpp": ["include", "ggml/include", "examples"],
+        "stable-diffusion.cpp": ["include", "thirdparty", "ggml/include"],
+    }
+
+    def _check_vendor_by_name(
+        self,
+        builder: "AbstractBuilder",
+        clones: dict[str, Path],
+    ) -> list[str]:
+        """Diff each committed header against its counterpart in a clone.
+
+        llama.cpp gets an exact `diff -r` against a replayed header-copy
+        (see `do_check_vendor`), which also catches *extra* committed files.
+        whisper.cpp and stable-diffusion.cpp cannot use that form: part of
+        their committed trees is installed by `cmake --install`, so replaying
+        it would require a full build -- far too slow for a PR check. Every
+        installed header is nonetheless copied verbatim from the source tree,
+        so comparing by filename against a plain checkout is equivalent for
+        content drift, which is the failure mode that matters.
+
+        stable-diffusion.cpp is special-cased: its committed ggml/gguf headers
+        come from llama.cpp, not from sd's own vendored copy, because
+        `_sync_ggml_abi` overwrites them so the two agree on struct layout.
+        They are therefore checked against the llama.cpp clone. This reflects
+        the default build; `SD_USE_VENDORED_GGML=1` is not what ships.
+        """
+        roots = self._VENDOR_HEADER_ROOTS[builder.name]
+        own = clones[builder.name]
+        problems: list[str] = []
+
+        for committed in sorted(builder.include.rglob("*")):
+            if not committed.is_file():
+                continue
+            src = own
+            if builder.name == "stable-diffusion.cpp" and (
+                committed.name.startswith("ggml") or committed.name == "gguf.h"
+            ):
+                src = clones["llama.cpp"]
+            candidates = [c for r in roots if (c := src / r / committed.name).is_file()]
+            if not candidates:
+                problems.append(f"{committed.name}: no counterpart in {src.name} checkout")
+            elif len({c.read_bytes() for c in candidates}) > 1:
+                problems.append(f"{committed.name}: ambiguous, differing candidates in {roots}")
+            elif candidates[0].read_bytes() != committed.read_bytes():
+                problems.append(f"{committed.name}: differs from upstream")
+        return problems
+
     def do_check_vendor(self, args: argparse.Namespace) -> None:
-        """verify thirdparty/llama.cpp/include/ matches pinned llama.cpp version"""
+        """verify thirdparty/*/include/ matches the pinned upstream versions"""
         import subprocess
         import tempfile
 
         builder = LlamaCppBuilder()
+        others = [WhisperCppBuilder(), StableDiffusionCppBuilder()]
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3176,6 +3325,45 @@ class Application(ShellCmd, metaclass=MetaCommander):
                 print(result.stderr, file=sys.stderr)
                 sys.exit(1)
             print(f"OK: vendored headers match llama.cpp@{builder.version}")
+
+            # whisper.cpp / stable-diffusion.cpp: filename-based comparison
+            # against a plain checkout (see _check_vendor_by_name for why the
+            # llama.cpp form does not transfer).
+            clones = {"llama.cpp": src}
+            failed = False
+            for other in others:
+                dest = tmp_path / other.name
+                subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--depth",
+                        "1",
+                        "--branch",
+                        other.version,
+                        "--recurse-submodules",
+                        "--shallow-submodules",
+                        other.repo_url,
+                        str(dest),
+                    ],
+                    check=True,
+                )
+                clones[other.name] = dest
+
+            for other in others:
+                problems = self._check_vendor_by_name(other, clones)
+                if problems:
+                    failed = True
+                    print(
+                        f"ERROR: thirdparty/{other.name}/include/ differs from pinned {other.name}@{other.version}",
+                        file=sys.stderr,
+                    )
+                    for p in problems:
+                        print(f"  {p}", file=sys.stderr)
+                else:
+                    print(f"OK: vendored headers match {other.name}@{other.version}")
+            if failed:
+                sys.exit(1)
 
     # ------------------------------------------------------------------------
     # test

@@ -39,6 +39,9 @@ cdef extern from "stable-diffusion.h":
         EULER_CFG_PP_SAMPLE_METHOD
         EULER_A_CFG_PP_SAMPLE_METHOD
         EULER_GE_SAMPLE_METHOD
+        DPMPP2M_SDE_SAMPLE_METHOD
+        DPMPP2M_SDE_BT_SAMPLE_METHOD
+        LMS_SAMPLE_METHOD
         SAMPLE_METHOD_COUNT
 
     ctypedef enum scheduler_t:
@@ -54,6 +57,10 @@ cdef extern from "stable-diffusion.h":
         LCM_SCHEDULER
         BONG_TANGENT_SCHEDULER
         LTX2_SCHEDULER
+        LOGIT_NORMAL_SCHEDULER
+        FLUX2_SCHEDULER
+        FLUX_SCHEDULER
+        BETA_SCHEDULER
         SCHEDULER_COUNT
 
     ctypedef enum prediction_t:
@@ -62,7 +69,8 @@ cdef extern from "stable-diffusion.h":
         EDM_V_PRED
         FLOW_PRED
         FLUX_FLOW_PRED
-        FLUX2_FLOW_PRED
+        SEFI_FLOW_PRED
+        MINIT2I_FLOW_PRED
         PREDICTION_COUNT
 
     ctypedef enum sd_type_t:
@@ -126,6 +134,7 @@ cdef extern from "stable-diffusion.h":
         SD_VAE_FORMAT_FLUX
         SD_VAE_FORMAT_SD3
         SD_VAE_FORMAT_FLUX2
+        SD_VAE_FORMAT_WAN
         SD_VAE_FORMAT_COUNT
 
     # =========================================================================
@@ -167,40 +176,36 @@ cdef extern from "stable-diffusion.h":
         const char* audio_vae_path
         const char* taesd_path
         const char* control_net_path
+        const char* ip_adapter_path
+        const char* motion_module_path
         const sd_embedding_t* embeddings
         uint32_t embedding_count
         const char* photo_maker_path
+        const char* pulid_weights_path
         const char* tensor_type_rules
-        bint vae_decode_only
-        bint free_params_immediately
         int n_threads
         sd_type_t wtype
         rng_type_t rng_type
         rng_type_t sampler_rng_type
         prediction_t prediction
         lora_apply_mode_t lora_apply_mode
-        bint offload_params_to_cpu
         bint enable_mmap
-        bint keep_clip_on_cpu
-        bint keep_control_net_on_cpu
-        bint keep_vae_on_cpu
         bint flash_attn
         bint diffusion_flash_attn
         bint tae_preview_only
         bint diffusion_conv_direct
         bint vae_conv_direct
-        bint circular_x
-        bint circular_y
         bint force_sdxl_vae_conv_scale
-        bint chroma_use_dit_mask
-        bint chroma_use_t5_mask
-        int chroma_t5_mask_pad
-        bint qwen_image_zero_cond_t
         sd_vae_format_t vae_format
-        float max_vram
+        const char* max_vram
         bint stream_layers
+        bint eager_load
         const char* backend
         const char* params_backend
+        const char* split_mode
+        bint auto_fit
+        const char* rpc_servers
+        const char* model_args
 
     ctypedef struct sd_audio_t:
         uint32_t sample_rate
@@ -244,6 +249,10 @@ cdef extern from "stable-diffusion.h":
         int id_images_count
         const char* id_embed_path
         float style_strength
+
+    ctypedef struct sd_pulid_params_t:
+        const char* id_embedding_path
+        float id_weight
 
     cdef enum sd_cache_mode_t:
         SD_CACHE_DISABLED = 0
@@ -314,8 +323,7 @@ cdef extern from "stable-diffusion.h":
         sd_image_t init_image
         sd_image_t* ref_images
         int ref_images_count
-        bint auto_resize_ref_image
-        bint increase_ref_index
+        const char* ref_image_args
         sd_image_t mask_image
         int width
         int height
@@ -325,10 +333,16 @@ cdef extern from "stable-diffusion.h":
         int batch_count
         sd_image_t control_image
         float control_strength
+        sd_image_t ip_adapter_image
+        float ip_adapter_strength
         sd_pm_params_t pm_params
+        sd_pulid_params_t pulid_params
         sd_tiling_params_t vae_tiling_params
         sd_cache_params_t cache
         sd_hires_params_t hires
+        int qwen_image_layers
+        bint circular_x
+        bint circular_y
 
     ctypedef struct sd_vid_gen_params_t:
         const sd_lora_t* loras
@@ -353,6 +367,8 @@ cdef extern from "stable-diffusion.h":
         sd_tiling_params_t vae_tiling_params
         sd_cache_params_t cache
         sd_hires_params_t hires
+        bint circular_x
+        bint circular_y
 
     # Opaque context types
     ctypedef struct sd_ctx_t:
@@ -385,6 +401,11 @@ cdef extern from "stable-diffusion.h":
     const char* sd_get_system_info()
     bint sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx)
     bint sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx)
+
+    # ControlNet hot-swap APIs are not safe to call while generation is in flight.
+    bint sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path)
+    bint sd_ctx_unload_control_net(sd_ctx_t* sd_ctx)
+    bint sd_ctx_has_control_net(const sd_ctx_t* sd_ctx)
 
     # =========================================================================
     # Functions - Type/enum name conversions
@@ -436,7 +457,14 @@ cdef extern from "stable-diffusion.h":
     # Functions - Image generation
     # =========================================================================
 
-    sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params) nogil
+    bint generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_gen_params, sd_image_t** images_out, int* num_images_out) nogil
+
+    ctypedef enum sd_cancel_mode_t:
+        SD_CANCEL_ALL
+        SD_CANCEL_NEW_LATENTS
+        SD_CANCEL_RESET
+
+    void sd_cancel_generation(sd_ctx_t* sd_ctx, sd_cancel_mode_t mode)
 
     # =========================================================================
     # Functions - Video generation
@@ -449,15 +477,39 @@ cdef extern from "stable-diffusion.h":
     # =========================================================================
 
     upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,
-                                      bint offload_params_to_cpu,
                                       bint direct,
                                       int n_threads,
                                       int tile_size,
                                       const char* backend,
                                       const char* params_backend)
     void free_upscaler_ctx(upscaler_ctx_t* upscaler_ctx)
-    sd_image_t upscale(upscaler_ctx_t* upscaler_ctx, sd_image_t input_image, uint32_t upscale_factor) nogil
+    bint upscale(upscaler_ctx_t* upscaler_ctx, sd_image_t input_image, uint32_t upscale_factor, sd_image_t** images_out, int* num_images_out) nogil
     int get_upscale_factor(upscaler_ctx_t* upscaler_ctx)
+
+    # =========================================================================
+    # Functions - After-detailer (adetailer)
+    # =========================================================================
+
+    ctypedef struct adetailer_ctx_t:
+        pass
+
+    ctypedef struct sd_adetailer_params_t:
+        const char* prompt
+        const char* negative_prompt
+        const char* extra_ad_args
+
+    adetailer_ctx_t* new_adetailer_ctx(const char* detector_path,
+                                       int n_threads,
+                                       const char* backend,
+                                       const char* params_backend)
+    void free_adetailer_ctx(adetailer_ctx_t* adetailer_ctx)
+    bint adetail_image(adetailer_ctx_t* adetailer_ctx,
+                       sd_ctx_t* sd_ctx,
+                       sd_image_t input_image,
+                       const sd_adetailer_params_t* adetailer_params,
+                       const sd_img_gen_params_t* inpaint_params,
+                       sd_image_t** images_out,
+                       int* num_images_out) nogil
 
     # =========================================================================
     # Functions - Model conversion
@@ -470,6 +522,18 @@ cdef extern from "stable-diffusion.h":
                  const char* tensor_type_rules,
                  bint convert_name)
 
+    bint convert_with_components(const char* model_path,
+                                 const char* clip_l_path,
+                                 const char* clip_g_path,
+                                 const char* t5xxl_path,
+                                 const char* diffusion_model_path,
+                                 const char* vae_path,
+                                 const char* output_path,
+                                 sd_type_t output_type,
+                                 const char* tensor_type_rules,
+                                 bint convert_name,
+                                 int n_threads)
+
     # =========================================================================
     # Functions - Preprocessing
     # =========================================================================
@@ -480,6 +544,25 @@ cdef extern from "stable-diffusion.h":
                           float weak,
                           float strong,
                           bint inverse)
+
+    # =========================================================================
+    # Functions - Importance matrix (imatrix) collection for quantization
+    # =========================================================================
+
+    # Cython-side aliases avoid shadowing by the same-named Python wrappers.
+    bint c_load_imatrix "load_imatrix" (const char* imatrix_path)
+    void c_save_imatrix "save_imatrix" (const char* imatrix_path)
+    void c_enable_imatrix_collection "enable_imatrix_collection" ()
+    void c_disable_imatrix_collection "disable_imatrix_collection" ()
+
+    # =========================================================================
+    # Functions - Backend device enumeration
+    # =========================================================================
+
+    # List available ggml backend devices, one `name<TAB>description` per line.
+    # Returns the number of bytes required (excluding NUL). Passing NULL or a
+    # zero buffer_size only queries the required size.
+    size_t sd_list_devices(char* buffer, size_t buffer_size)
 
     # =========================================================================
     # Functions - Version info

@@ -79,6 +79,9 @@ class SampleMethod(IntEnum):
     EULER_CFG_PP = EULER_CFG_PP_SAMPLE_METHOD
     EULER_A_CFG_PP = EULER_A_CFG_PP_SAMPLE_METHOD
     EULER_GE = EULER_GE_SAMPLE_METHOD
+    DPMPP2M_SDE = DPMPP2M_SDE_SAMPLE_METHOD
+    DPMPP2M_SDE_BT = DPMPP2M_SDE_BT_SAMPLE_METHOD
+    LMS = LMS_SAMPLE_METHOD
     COUNT = SAMPLE_METHOD_COUNT
 
 
@@ -96,6 +99,10 @@ class Scheduler(IntEnum):
     LCM = LCM_SCHEDULER
     BONG_TANGENT = BONG_TANGENT_SCHEDULER
     LTX2 = LTX2_SCHEDULER
+    LOGIT_NORMAL = LOGIT_NORMAL_SCHEDULER
+    FLUX2 = FLUX2_SCHEDULER
+    FLUX = FLUX_SCHEDULER
+    BETA = BETA_SCHEDULER
     COUNT = SCHEDULER_COUNT
 
 
@@ -106,8 +113,20 @@ class Prediction(IntEnum):
     EDM_V = EDM_V_PRED
     FLOW = FLOW_PRED
     FLUX_FLOW = FLUX_FLOW_PRED
-    FLUX2_FLOW = FLUX2_FLOW_PRED
+    SEFI_FLOW = SEFI_FLOW_PRED
+    MINIT2I_FLOW = MINIT2I_FLOW_PRED
     COUNT = PREDICTION_COUNT
+
+
+class CancelMode(IntEnum):
+    """Cancellation modes for SDContext.cancel()."""
+    # Stop the current generation as soon as possible.
+    ALL = SD_CANCEL_ALL
+    # Finish the current image sample, then skip remaining batch latents
+    # and return the completed images.
+    NEW_LATENTS = SD_CANCEL_NEW_LATENTS
+    # Clear a pending cancellation request.
+    RESET = SD_CANCEL_RESET
 
 
 class SDType(IntEnum):
@@ -159,6 +178,7 @@ class VaeFormat(IntEnum):
     FLUX = SD_VAE_FORMAT_FLUX
     SD3 = SD_VAE_FORMAT_SD3
     FLUX2 = SD_VAE_FORMAT_FLUX2
+    WAN = SD_VAE_FORMAT_WAN
 
 
 class HiresUpscaler(IntEnum):
@@ -896,8 +916,15 @@ cdef class SDContextParams:
     cdef bytes _vae_path_bytes
     cdef bytes _taesd_path_bytes
     cdef bytes _control_net_path_bytes
+    cdef bytes _ip_adapter_path_bytes
+    cdef bytes _motion_module_path_bytes
     cdef bytes _photo_maker_path_bytes
+    cdef bytes _pulid_weights_path_bytes
     cdef bytes _tensor_type_rules_bytes
+    cdef bytes _max_vram_bytes
+    cdef bytes _rpc_servers_bytes
+    cdef bytes _split_mode_bytes
+    cdef bytes _model_args_bytes
 
     def __cinit__(self):
         sd_ctx_params_init(&self._params)
@@ -910,8 +937,7 @@ cdef class SDContextParams:
                  t5xxl_path: Optional[str] = None,
                  diffusion_model_path: Optional[str] = None,
                  n_threads: int = -1,
-                 wtype: SDType = SDType.COUNT,
-                 vae_decode_only: bool = True):
+                 wtype: SDType = SDType.COUNT):
         """
         Initialize context parameters.
 
@@ -924,7 +950,6 @@ cdef class SDContextParams:
             diffusion_model_path: Path to diffusion model (for split models)
             n_threads: Number of threads (-1 for auto)
             wtype: Weight type for computation
-            vae_decode_only: Only decode VAE (faster if not doing img2img)
         """
         if model_path:
             self.model_path = model_path
@@ -941,7 +966,6 @@ cdef class SDContextParams:
         if n_threads > 0:
             self.n_threads = n_threads
         self.wtype = wtype
-        self.vae_decode_only = vae_decode_only
 
     # --- Model paths ---
 
@@ -1065,15 +1089,6 @@ cdef class SDContextParams:
         self._params.rng_type = <rng_type_t>value
 
     @property
-    def vae_decode_only(self) -> bool:
-        """Only decode VAE (faster if not doing img2img)."""
-        return self._params.vae_decode_only
-
-    @vae_decode_only.setter
-    def vae_decode_only(self, value: bool):
-        self._params.vae_decode_only = value
-
-    @property
     def flash_attn(self) -> bool:
         """Use flash attention."""
         return self._params.flash_attn
@@ -1090,15 +1105,6 @@ cdef class SDContextParams:
     @diffusion_flash_attn.setter
     def diffusion_flash_attn(self, value: bool):
         self._params.diffusion_flash_attn = value
-
-    @property
-    def offload_params_to_cpu(self) -> bool:
-        """Offload parameters to CPU."""
-        return self._params.offload_params_to_cpu
-
-    @offload_params_to_cpu.setter
-    def offload_params_to_cpu(self, value: bool):
-        self._params.offload_params_to_cpu = value
 
     @property
     def enable_mmap(self) -> bool:
@@ -1217,6 +1223,36 @@ cdef class SDContextParams:
             self._params.control_net_path = NULL
 
     @property
+    def ip_adapter_path(self) -> Optional[str]:
+        """Path to IP-Adapter model."""
+        if self._params.ip_adapter_path:
+            return self._params.ip_adapter_path.decode('utf-8')
+        return None
+
+    @ip_adapter_path.setter
+    def ip_adapter_path(self, value: Optional[str]):
+        if value:
+            self._ip_adapter_path_bytes = value.encode('utf-8')
+            self._params.ip_adapter_path = self._ip_adapter_path_bytes
+        else:
+            self._params.ip_adapter_path = NULL
+
+    @property
+    def motion_module_path(self) -> Optional[str]:
+        """Path to motion module model."""
+        if self._params.motion_module_path:
+            return self._params.motion_module_path.decode('utf-8')
+        return None
+
+    @motion_module_path.setter
+    def motion_module_path(self, value: Optional[str]):
+        if value:
+            self._motion_module_path_bytes = value.encode('utf-8')
+            self._params.motion_module_path = self._motion_module_path_bytes
+        else:
+            self._params.motion_module_path = NULL
+
+    @property
     def photo_maker_path(self) -> Optional[str]:
         """Path to PhotoMaker model."""
         if self._params.photo_maker_path:
@@ -1276,42 +1312,6 @@ cdef class SDContextParams:
         self._params.lora_apply_mode = <lora_apply_mode_t>value
 
     @property
-    def free_params_immediately(self) -> bool:
-        """Free parameters immediately after use."""
-        return self._params.free_params_immediately
-
-    @free_params_immediately.setter
-    def free_params_immediately(self, value: bool):
-        self._params.free_params_immediately = value
-
-    @property
-    def keep_clip_on_cpu(self) -> bool:
-        """Keep CLIP model on CPU (for low VRAM)."""
-        return self._params.keep_clip_on_cpu
-
-    @keep_clip_on_cpu.setter
-    def keep_clip_on_cpu(self, value: bool):
-        self._params.keep_clip_on_cpu = value
-
-    @property
-    def keep_control_net_on_cpu(self) -> bool:
-        """Keep ControlNet on CPU (for low VRAM)."""
-        return self._params.keep_control_net_on_cpu
-
-    @keep_control_net_on_cpu.setter
-    def keep_control_net_on_cpu(self, value: bool):
-        self._params.keep_control_net_on_cpu = value
-
-    @property
-    def keep_vae_on_cpu(self) -> bool:
-        """Keep VAE on CPU (for low VRAM)."""
-        return self._params.keep_vae_on_cpu
-
-    @keep_vae_on_cpu.setter
-    def keep_vae_on_cpu(self, value: bool):
-        self._params.keep_vae_on_cpu = value
-
-    @property
     def tae_preview_only(self) -> bool:
         """Use TAESD only for preview, not final decode."""
         return self._params.tae_preview_only
@@ -1339,24 +1339,6 @@ cdef class SDContextParams:
         self._params.vae_conv_direct = value
 
     @property
-    def circular_x(self) -> bool:
-        """Enable circular padding in X dimension (tileable generation)."""
-        return self._params.circular_x
-
-    @circular_x.setter
-    def circular_x(self, value: bool):
-        self._params.circular_x = value
-
-    @property
-    def circular_y(self) -> bool:
-        """Enable circular padding in Y dimension (tileable generation)."""
-        return self._params.circular_y
-
-    @circular_y.setter
-    def circular_y(self, value: bool):
-        self._params.circular_y = value
-
-    @property
     def force_sdxl_vae_conv_scale(self) -> bool:
         """Force conv scale on SDXL VAE."""
         return self._params.force_sdxl_vae_conv_scale
@@ -1366,49 +1348,51 @@ cdef class SDContextParams:
         self._params.force_sdxl_vae_conv_scale = value
 
     @property
-    def chroma_use_dit_mask(self) -> bool:
-        """Use DiT mask for Chroma models."""
-        return self._params.chroma_use_dit_mask
+    def auto_fit(self) -> bool:
+        """Automatically fit the model into the available memory budget."""
+        return self._params.auto_fit
 
-    @chroma_use_dit_mask.setter
-    def chroma_use_dit_mask(self, value: bool):
-        self._params.chroma_use_dit_mask = value
-
-    @property
-    def chroma_use_t5_mask(self) -> bool:
-        """Use T5 mask for Chroma models."""
-        return self._params.chroma_use_t5_mask
-
-    @chroma_use_t5_mask.setter
-    def chroma_use_t5_mask(self, value: bool):
-        self._params.chroma_use_t5_mask = value
+    @auto_fit.setter
+    def auto_fit(self, value: bool):
+        self._params.auto_fit = value
 
     @property
-    def chroma_t5_mask_pad(self) -> int:
-        """T5 mask pad size for Chroma."""
-        return self._params.chroma_t5_mask_pad
+    def model_args(self) -> Optional[str]:
+        """Extra model args as a comma-separated key=value list (e.g.
+        "chroma_use_dit_mask=0,chroma_t5_mask_pad=10,qwen_image_zero_cond_t=1").
+        Consumed by the diffusion-model loader; keys accepted depend on the
+        architecture (Chroma/Flux, Qwen-Image). None when unset."""
+        if self._params.model_args:
+            return self._params.model_args.decode('utf-8')
+        return None
 
-    @chroma_t5_mask_pad.setter
-    def chroma_t5_mask_pad(self, value: int):
-        self._params.chroma_t5_mask_pad = value
+    @model_args.setter
+    def model_args(self, value: Optional[str]):
+        if value:
+            self._model_args_bytes = value.encode('utf-8')
+            self._params.model_args = self._model_args_bytes
+        else:
+            self._params.model_args = NULL
 
     @property
-    def qwen_image_zero_cond_t(self) -> bool:
-        """Use zero conditioning for Qwen image models."""
-        return self._params.qwen_image_zero_cond_t
-
-    @qwen_image_zero_cond_t.setter
-    def qwen_image_zero_cond_t(self, value: bool):
-        self._params.qwen_image_zero_cond_t = value
-
-    @property
-    def max_vram(self) -> float:
-        """Maximum VRAM to use (0 = unlimited)."""
-        return self._params.max_vram
+    def max_vram(self) -> Optional[str]:
+        """GiB budget or backend-assignment spec for graph-cut segmented param
+        offload ("0" = disabled, "-1" = auto). None when unset."""
+        if self._params.max_vram:
+            return self._params.max_vram.decode('utf-8')
+        return None
 
     @max_vram.setter
-    def max_vram(self, value: float):
-        self._params.max_vram = value
+    def max_vram(self, value):
+        if value is None:
+            self._max_vram_bytes = None
+            self._params.max_vram = NULL
+            return
+        # Accept numeric values for backwards compatibility (e.g. -1, 4.0).
+        if not isinstance(value, str):
+            value = str(value)
+        self._max_vram_bytes = value.encode('utf-8')
+        self._params.max_vram = self._max_vram_bytes
 
     @property
     def vae_format(self) -> VaeFormat:
@@ -1428,6 +1412,62 @@ cdef class SDContextParams:
     @stream_layers.setter
     def stream_layers(self, value: bool):
         self._params.stream_layers = value
+
+    @property
+    def eager_load(self) -> bool:
+        """Load all params into the params backend at model-load time instead
+        of lazily on first use."""
+        return self._params.eager_load
+
+    @eager_load.setter
+    def eager_load(self, value: bool):
+        self._params.eager_load = value
+
+    @property
+    def pulid_weights_path(self) -> Optional[str]:
+        """Path to PuLID weights."""
+        if self._params.pulid_weights_path:
+            return self._params.pulid_weights_path.decode('utf-8')
+        return None
+
+    @pulid_weights_path.setter
+    def pulid_weights_path(self, value: Optional[str]):
+        if value:
+            self._pulid_weights_path_bytes = value.encode('utf-8')
+            self._params.pulid_weights_path = self._pulid_weights_path_bytes
+        else:
+            self._params.pulid_weights_path = NULL
+
+    @property
+    def rpc_servers(self) -> Optional[str]:
+        """Comma-separated list of RPC server endpoints."""
+        if self._params.rpc_servers:
+            return self._params.rpc_servers.decode('utf-8')
+        return None
+
+    @rpc_servers.setter
+    def rpc_servers(self, value: Optional[str]):
+        if value:
+            self._rpc_servers_bytes = value.encode('utf-8')
+            self._params.rpc_servers = self._rpc_servers_bytes
+        else:
+            self._params.rpc_servers = NULL
+
+    @property
+    def split_mode(self) -> Optional[str]:
+        """Weight distribution for multi-device modules: 'layer' (default) or
+        'row', or per-module assignments e.g. 'diffusion=row'."""
+        if self._params.split_mode:
+            return self._params.split_mode.decode('utf-8')
+        return None
+
+    @split_mode.setter
+    def split_mode(self, value: Optional[str]):
+        if value:
+            self._split_mode_bytes = value.encode('utf-8')
+            self._params.split_mode = self._split_mode_bytes
+        else:
+            self._params.split_mode = NULL
 
     def __str__(self) -> str:
         """Get string representation of parameters."""
@@ -1666,12 +1706,15 @@ cdef class SDImageGenParams:
     cdef bytes _prompt_bytes
     cdef bytes _negative_prompt_bytes
     cdef bytes _pm_id_embed_path_bytes
+    cdef bytes _pulid_id_embedding_path_bytes
     cdef bytes _scm_mask_bytes
     cdef bytes _hires_model_path_bytes
     cdef SDSampleParams _sample_params
     cdef SDImage _init_image
     cdef SDImage _mask_image
     cdef SDImage _control_image
+    cdef SDImage _ip_adapter_image
+    cdef bytes _ref_image_args_bytes
     cdef list _ref_images  # keep SDImage refs alive
     cdef sd_image_t* _ref_images_buf
     cdef list _lora_paths_bytes  # keep bytes refs alive for lora paths
@@ -1689,6 +1732,8 @@ cdef class SDImageGenParams:
         self._pm_id_images = None
         self._pm_id_images_buf = NULL
         self._pm_id_embed_path_bytes = None
+        self._pulid_id_embedding_path_bytes = None
+        self._ref_image_args_bytes = None
         self._scm_mask_bytes = None
         self._hires_model_path_bytes = None
 
@@ -1825,6 +1870,33 @@ cdef class SDImageGenParams:
         self._params.clip_skip = value
 
     @property
+    def qwen_image_layers(self) -> int:
+        """Number of Qwen-Image transformer layers to run (0 = model default)."""
+        return self._params.qwen_image_layers
+
+    @qwen_image_layers.setter
+    def qwen_image_layers(self, value: int):
+        self._params.qwen_image_layers = value
+
+    @property
+    def circular_x(self) -> bool:
+        """Enable circular padding in X dimension (tileable generation)."""
+        return self._params.circular_x
+
+    @circular_x.setter
+    def circular_x(self, value: bool):
+        self._params.circular_x = value
+
+    @property
+    def circular_y(self) -> bool:
+        """Enable circular padding in Y dimension (tileable generation)."""
+        return self._params.circular_y
+
+    @circular_y.setter
+    def circular_y(self, value: bool):
+        self._params.circular_y = value
+
+    @property
     def sample_params(self) -> SDSampleParams:
         """Sampling parameters."""
         return self._sample_params
@@ -1858,6 +1930,21 @@ cdef class SDImageGenParams:
     @control_strength.setter
     def control_strength(self, value: float):
         self._params.control_strength = value
+
+    def set_ip_adapter_image(self, image: SDImage, strength: float = 1.0):
+        """Set the reference image for the IP-Adapter."""
+        self._ip_adapter_image = image
+        self._params.ip_adapter_image = image._image
+        self._params.ip_adapter_strength = strength
+
+    @property
+    def ip_adapter_strength(self) -> float:
+        """IP-Adapter strength (0.0-1.0+)."""
+        return self._params.ip_adapter_strength
+
+    @ip_adapter_strength.setter
+    def ip_adapter_strength(self, value: float):
+        self._params.ip_adapter_strength = value
 
     # --- VAE Tiling parameters ---
 
@@ -1954,22 +2041,23 @@ cdef class SDImageGenParams:
     # --- Reference image params ---
 
     @property
-    def auto_resize_ref_image(self) -> bool:
-        """Auto resize reference images."""
-        return self._params.auto_resize_ref_image
+    def ref_image_args(self) -> str:
+        """Reference image options as a comma-separated 'key=value' string.
 
-    @auto_resize_ref_image.setter
-    def auto_resize_ref_image(self, value: bool):
-        self._params.auto_resize_ref_image = value
+        Recognized keys include 'preset', 'pass_to_vlm', 'pass_to_dit',
+        'ref_index_mode' (fixed|increase|decrease), 'force_ref_timestep_zero',
+        'resize_before_vae', 'vae_input_max_pixels', 'vlm_resize_mode'
+        (longest_side|area|none), 'vlm_max_size', 'vlm_min_size' and 'vlm_size'.
+        Unknown keys are ignored by the backend with a warning.
+        """
+        if self._params.ref_image_args:
+            return self._params.ref_image_args.decode('utf-8')
+        return ""
 
-    @property
-    def increase_ref_index(self) -> bool:
-        """Increase reference index per batch."""
-        return self._params.increase_ref_index
-
-    @increase_ref_index.setter
-    def increase_ref_index(self, value: bool):
-        self._params.increase_ref_index = value
+    @ref_image_args.setter
+    def ref_image_args(self, value: str):
+        self._ref_image_args_bytes = (value or "").encode('utf-8')
+        self._params.ref_image_args = self._ref_image_args_bytes
 
     # --- LoRA parameters ---
 
@@ -2073,6 +2161,38 @@ cdef class SDImageGenParams:
     @pm_style_strength.setter
     def pm_style_strength(self, value: float):
         self._params.pm_params.style_strength = value
+
+    # --- PuLID parameters ---
+    #
+    # PuLID is an identity-customization method (like Photo Maker) that
+    # conditions generation on a precomputed face/identity embedding. It
+    # requires PuLID weights loaded via SDContextParams.pulid_weights_path;
+    # these per-generation params point at the embedding and set its weight.
+
+    @property
+    def pulid_id_embedding_path(self) -> Optional[str]:
+        """Path to the precomputed PuLID identity embedding."""
+        if self._params.pulid_params.id_embedding_path == NULL:
+            return None
+        return self._params.pulid_params.id_embedding_path.decode('utf-8')
+
+    @pulid_id_embedding_path.setter
+    def pulid_id_embedding_path(self, value: Optional[str]):
+        if value is None:
+            self._params.pulid_params.id_embedding_path = NULL
+            self._pulid_id_embedding_path_bytes = None
+        else:
+            self._pulid_id_embedding_path_bytes = value.encode('utf-8')
+            self._params.pulid_params.id_embedding_path = <const char*>self._pulid_id_embedding_path_bytes
+
+    @property
+    def pulid_id_weight(self) -> float:
+        """Weight applied to the PuLID identity embedding."""
+        return self._params.pulid_params.id_weight
+
+    @pulid_id_weight.setter
+    def pulid_id_weight(self, value: float):
+        self._params.pulid_params.id_weight = value
 
     # --- VAE Tiling relative size ---
 
@@ -2520,8 +2640,11 @@ cdef class SDContext:
             ("clip_g_path", "CLIP-G"),
             ("t5xxl_path", "T5-XXL"),
             ("control_net_path", "ControlNet"),
+            ("ip_adapter_path", "IP-Adapter"),
+            ("motion_module_path", "motion module"),
             ("taesd_path", "TAESD"),
             ("photo_maker_path", "PhotoMaker"),
+            ("pulid_weights_path", "PuLID"),
         )
         for attr, label in path_specs:
             value = getattr(params, attr, None)
@@ -2571,6 +2694,58 @@ cdef class SDContext:
         if self._ctx == NULL:
             raise RuntimeError("Context not initialized")
         return sd_ctx_supports_video_generation(self._ctx)
+
+    @property
+    def has_control_net(self) -> bool:
+        """Whether a ControlNet is currently loaded into this context.
+
+        Mirrors upstream ``sd_ctx_has_control_net``.
+        """
+        if self._ctx == NULL:
+            raise RuntimeError("Context not initialized")
+        return sd_ctx_has_control_net(self._ctx)
+
+    def load_control_net(self, path: str) -> bool:
+        """Hot-swap a ControlNet into this context from ``path``.
+
+        Mirrors upstream ``sd_ctx_load_control_net``. Returns True on success.
+        Not safe to call while a generation is in flight.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            RuntimeError: If the context is not initialized.
+        """
+        if self._ctx == NULL:
+            raise RuntimeError("Context not initialized")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"control net not found: {path}")
+        cdef bytes path_bytes = path.encode('utf-8')
+        return sd_ctx_load_control_net(self._ctx, path_bytes)
+
+    def unload_control_net(self) -> bool:
+        """Unload the currently loaded ControlNet from this context.
+
+        Mirrors upstream ``sd_ctx_unload_control_net``. Returns True on success.
+        Not safe to call while a generation is in flight.
+        """
+        if self._ctx == NULL:
+            raise RuntimeError("Context not initialized")
+        return sd_ctx_unload_control_net(self._ctx)
+
+    def cancel(self, mode: CancelMode = CancelMode.ALL) -> None:
+        """Request cancellation of an in-flight generation.
+
+        Intended to be called from a different thread than the one running
+        generate() / generate_video(): those release the GIL during native
+        sampling, so this signals the native loop to stop. ``mode`` selects
+        how aggressively to stop (see CancelMode). Pass CancelMode.RESET to
+        clear a pending request. This deliberately does not take the busy
+        lock, since the generating thread holds it.
+        """
+        if self._ctx == NULL:
+            raise RuntimeError("Context not initialized")
+        cdef int mode_i = int(mode)
+        sd_cancel_generation(self._ctx, <sd_cancel_mode_t>mode_i)
 
     def get_default_sample_method(self) -> SampleMethod:
         """Get the default sampling method for the loaded model."""
@@ -2729,16 +2904,18 @@ cdef class SDContext:
         # fields onto `params` itself.
         params._params.sample_params = params._sample_params._params
 
-        cdef sd_image_t* result
+        cdef sd_image_t* result = NULL
+        cdef int num_images = 0
+        cdef bint ok = False
         cdef sd_ctx_t* ctx_ptr = self._ctx
         cdef sd_img_gen_params_t* params_ptr = &params._params
         self._try_acquire_busy()
         try:
             with nogil:
-                result = generate_image(ctx_ptr, params_ptr)
+                ok = generate_image(ctx_ptr, params_ptr, &result, &num_images)
         finally:
             self._busy_lock.release()
-        if result == NULL:
+        if not ok or result == NULL or num_images < 1:
             raise RuntimeError("Image generation failed")
 
         # Convert results to Python list, validating each image. The
@@ -2751,7 +2928,7 @@ cdef class SDContext:
         cdef int n_invalid = 0
         cdef int wrapped = 0
         try:
-            for i in range(params.batch_count):
+            for i in range(num_images):
                 img = SDImage._from_c_image(result[i], owns_data=True)
                 wrapped = i + 1
                 if not img.is_valid:
@@ -2760,7 +2937,7 @@ cdef class SDContext:
         except BaseException:
             # Free unwrapped C image data so they don't leak; wrapped
             # ones are owned by SDImage and freed via their __dealloc__.
-            for i in range(wrapped, params.batch_count):
+            for i in range(wrapped, num_images):
                 if result[i].data != NULL:
                     free(result[i].data)
             raise
@@ -2769,7 +2946,7 @@ cdef class SDContext:
             # wrapped successfully, is now owned by the SDImage objects).
             free(result)
 
-        if n_invalid == params.batch_count:
+        if n_invalid == num_images:
             raise RuntimeError(
                 "Image generation failed: all images have invalid data. "
                 "This usually means GPU memory allocation failed (out of memory). "
@@ -2989,7 +3166,6 @@ cdef class Upscaler:
     def __init__(self,
                  model_path: str,
                  n_threads: int = -1,
-                 offload_to_cpu: bool = False,
                  direct: bool = False,
                  tile_size: int = 0,
                  backend: Optional[str] = None,
@@ -3000,7 +3176,6 @@ cdef class Upscaler:
         Args:
             model_path: Path to ESRGAN model file
             n_threads: Number of threads (-1 for auto)
-            offload_to_cpu: Offload parameters to CPU
             direct: Use direct convolution
             tile_size: Tile size for processing (0 for default)
             backend: Backend name (e.g. "metal", "cuda"); None = auto
@@ -3025,7 +3200,6 @@ cdef class Upscaler:
 
         self._ctx = new_upscaler_ctx(
             self._model_path_bytes,
-            offload_to_cpu,
             direct,
             n_threads,
             tile_size,
@@ -3071,14 +3245,29 @@ cdef class Upscaler:
         cdef upscaler_ctx_t* ctx_ptr = self._ctx
         cdef sd_image_t input_img = image._image
         cdef uint32_t factor_c = <uint32_t>factor
-        cdef sd_image_t result
+        cdef sd_image_t* out_images = NULL
+        cdef int num_out = 0
+        cdef bint ok = False
+        cdef int j
         with nogil:
-            result = upscale(ctx_ptr, input_img, factor_c)
+            ok = upscale(ctx_ptr, input_img, factor_c, &out_images, &num_out)
 
-        if result.data == NULL:
+        if not ok or out_images == NULL or num_out < 1 or out_images[0].data == NULL:
+            if out_images != NULL:
+                for j in range(num_out):
+                    if out_images[j].data != NULL:
+                        free(out_images[j].data)
+                free(out_images)
             raise RuntimeError("Upscaling failed")
 
-        return SDImage._from_c_image(result, owns_data=True)
+        # `out_images[0].data` is handed to the SDImage (owns_data=True);
+        # free any extra images' data plus the outer array.
+        result = SDImage._from_c_image(out_images[0], owns_data=True)
+        for j in range(1, num_out):
+            if out_images[j].data != NULL:
+                free(out_images[j].data)
+        free(out_images)
+        return result
 
     def __enter__(self):
         """Context manager entry."""
@@ -3088,6 +3277,202 @@ cdef class Upscaler:
         """Context manager exit."""
         self.close()
         return False
+
+
+cdef class Adetailer:
+    """After-detailer: detect regions and re-generate them at full resolution.
+
+    A detection model (typically a YOLO face/hand detector) locates regions
+    in an image, and each is inpainted through an existing :class:`SDContext`
+    using a dedicated prompt. This is the standard fix for the small, mushy
+    faces that appear when a subject occupies only a fraction of the frame,
+    since the inpaint pass gives each region the model's full resolution.
+
+    Example:
+        with Adetailer("yolov8n-face.gguf") as ad:
+            fixed = ad.detail(sd_ctx, image, prompt="detailed face")
+    """
+    cdef adetailer_ctx_t* _ctx
+    cdef bytes _detector_path_bytes
+    cdef bytes _backend_bytes
+    cdef bytes _params_backend_bytes
+
+    def __cinit__(self):
+        self._ctx = NULL
+
+    def __dealloc__(self):
+        if self._ctx != NULL:
+            free_adetailer_ctx(self._ctx)
+            self._ctx = NULL
+
+    def close(self):
+        """Release the underlying adetailer context immediately. Idempotent."""
+        if self._ctx != NULL:
+            free_adetailer_ctx(self._ctx)
+            self._ctx = NULL
+
+    def __init__(self,
+                 detector_path: str,
+                 n_threads: int = -1,
+                 backend: Optional[str] = None,
+                 params_backend: Optional[str] = None):
+        """
+        Create an adetailer context.
+
+        Args:
+            detector_path: Path to the detection model (e.g. a YOLO face detector)
+            n_threads: Number of threads (-1 for auto)
+            backend: Backend name (e.g. "metal", "cuda"); None = auto
+            params_backend: Backend used to hold parameters; None = auto
+        """
+        if not os.path.exists(detector_path):
+            raise FileNotFoundError(f"Detector model not found: {detector_path}")
+
+        self._detector_path_bytes = detector_path.encode('utf-8')
+
+        if n_threads < 0:
+            n_threads = sd_get_num_physical_cores()
+
+        cdef const char* backend_c = NULL
+        cdef const char* params_backend_c = NULL
+        if backend is not None:
+            self._backend_bytes = backend.encode('utf-8')
+            backend_c = self._backend_bytes
+        if params_backend is not None:
+            self._params_backend_bytes = params_backend.encode('utf-8')
+            params_backend_c = self._params_backend_bytes
+
+        self._ctx = new_adetailer_ctx(
+            self._detector_path_bytes,
+            n_threads,
+            backend_c,
+            params_backend_c
+        )
+
+        if self._ctx == NULL:
+            raise RuntimeError(f"Failed to load detector model: {detector_path}")
+
+    @property
+    def is_valid(self) -> bool:
+        """Check if the adetailer context is valid."""
+        return self._ctx != NULL
+
+    def detail(self,
+               SDContext sd_ctx,
+               image: SDImage,
+               prompt: str = "",
+               negative_prompt: str = "",
+               extra_args: str = "",
+               SDImageGenParams inpaint_params=None) -> list:
+        """
+        Detect regions in an image and re-generate each one.
+
+        Args:
+            sd_ctx: Diffusion context used for the inpaint passes
+            image: Input image to refine
+            prompt: Prompt applied to each detected region
+            negative_prompt: Negative prompt for the region passes
+            extra_args: Extra detector arguments, passed through verbatim
+            inpaint_params: Generation parameters for the inpaint passes;
+                defaults are used when None
+
+        Returns:
+            List of SDImage results. Empty when the detector found nothing.
+
+        Raises:
+            RuntimeError: If the context is uninitialized or the pass fails
+        """
+        if self._ctx == NULL:
+            raise RuntimeError("Adetailer not initialized")
+        if sd_ctx is None:
+            raise ValueError("sd_ctx is required")
+
+        if inpaint_params is None:
+            inpaint_params = SDImageGenParams()
+
+        cdef bytes prompt_bytes = prompt.encode('utf-8')
+        cdef bytes neg_bytes = negative_prompt.encode('utf-8')
+        cdef bytes extra_bytes = extra_args.encode('utf-8')
+
+        cdef sd_adetailer_params_t ad_params
+        ad_params.prompt = <const char*>prompt_bytes
+        ad_params.negative_prompt = <const char*>neg_bytes
+        ad_params.extra_ad_args = <const char*>extra_bytes
+
+        cdef adetailer_ctx_t* ad_ptr = self._ctx
+        cdef sd_ctx_t* sd_ptr = sd_ctx._ctx
+        cdef sd_image_t input_img = image._image
+        cdef sd_img_gen_params_t* gen_ptr = &inpaint_params._params
+        cdef sd_image_t* out_images = NULL
+        cdef int num_out = 0
+        cdef bint ok = False
+        cdef int j
+
+        # adetail_image drives the diffusion context through several inpaint
+        # passes with the GIL released, so it must take the same
+        # single-user guard as SDContext.generate().
+        sd_ctx._try_acquire_busy()
+        try:
+            with nogil:
+                ok = adetail_image(ad_ptr, sd_ptr, input_img, &ad_params,
+                                   gen_ptr, &out_images, &num_out)
+        finally:
+            sd_ctx._busy_lock.release()
+
+        if not ok:
+            if out_images != NULL:
+                for j in range(num_out):
+                    if out_images[j].data != NULL:
+                        free(out_images[j].data)
+                free(out_images)
+            raise RuntimeError("Adetailer pass failed")
+
+        if out_images == NULL or num_out < 1:
+            # No detections is a legitimate outcome, not an error.
+            if out_images != NULL:
+                free(out_images)
+            return []
+
+        # Each image's `data` is handed to an SDImage (owns_data=True);
+        # only the outer array is freed here.
+        results = []
+        for j in range(num_out):
+            results.append(SDImage._from_c_image(out_images[j], owns_data=True))
+        free(out_images)
+        return results
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+        return False
+
+
+# =============================================================================
+# Version information
+# =============================================================================
+
+def version() -> str:
+    """Version string of the vendored stable-diffusion.cpp."""
+    cdef const char* v = sd_version()
+    if v == NULL:
+        return ""
+    return v.decode('utf-8')
+
+
+def commit() -> str:
+    """Git commit hash of the vendored stable-diffusion.cpp.
+
+    Useful in bug reports, since the vendored revision is otherwise not
+    visible from Python.
+    """
+    cdef const char* c = sd_commit()
+    if c == NULL:
+        return ""
+    return c.decode('utf-8')
 
 
 # =============================================================================
@@ -3151,6 +3536,191 @@ def convert_model(
         raise RuntimeError(f"Model conversion failed: {input_path} -> {output_path}")
 
     return True
+
+
+def convert_model_with_components(
+    output_path: str,
+    output_type: SDType = SDType.F16,
+    model_path: Optional[str] = None,
+    clip_l_path: Optional[str] = None,
+    clip_g_path: Optional[str] = None,
+    t5xxl_path: Optional[str] = None,
+    diffusion_model_path: Optional[str] = None,
+    vae_path: Optional[str] = None,
+    tensor_type_rules: Optional[str] = None,
+    convert_name: bool = False,
+    n_threads: int = -1
+) -> bool:
+    """
+    Convert a model to a different format/quantization from separate component
+    files (diffusion model, text encoders, VAE) rather than a single checkpoint.
+
+    At least one component path must be provided. Any component left as None is
+    passed through as NULL and skipped by the converter.
+
+    Args:
+        output_path: Path for output model
+        output_type: Output quantization type
+        model_path: Path to a combined model checkpoint (optional)
+        clip_l_path: Path to CLIP-L text encoder (optional)
+        clip_g_path: Path to CLIP-G text encoder (optional)
+        t5xxl_path: Path to T5-XXL text encoder (optional)
+        diffusion_model_path: Path to the diffusion model (optional)
+        vae_path: Path to VAE model (optional)
+        tensor_type_rules: Custom tensor type rules (optional)
+        convert_name: Convert tensor names (optional)
+        n_threads: Number of threads for conversion (-1 for auto)
+
+    Returns:
+        True if conversion successful
+
+    Raises:
+        ValueError: If no component path is provided
+        FileNotFoundError: If a provided component path does not exist
+        RuntimeError: If conversion fails
+    """
+    components = {
+        "model_path": model_path,
+        "clip_l_path": clip_l_path,
+        "clip_g_path": clip_g_path,
+        "t5xxl_path": t5xxl_path,
+        "diffusion_model_path": diffusion_model_path,
+        "vae_path": vae_path,
+    }
+    if not any(components.values()):
+        raise ValueError(
+            "convert_model_with_components requires at least one component path "
+            "(model_path, clip_l_path, clip_g_path, t5xxl_path, "
+            "diffusion_model_path, or vae_path)."
+        )
+    for name, path in components.items():
+        if path and not os.path.exists(path):
+            raise FileNotFoundError(f"{name} not found: {path}")
+
+    cdef bytes output_bytes = output_path.encode('utf-8')
+    cdef bytes model_bytes
+    cdef bytes clip_l_bytes
+    cdef bytes clip_g_bytes
+    cdef bytes t5xxl_bytes
+    cdef bytes diffusion_bytes
+    cdef bytes vae_bytes
+    cdef bytes rules_bytes
+    cdef const char* model_ptr = NULL
+    cdef const char* clip_l_ptr = NULL
+    cdef const char* clip_g_ptr = NULL
+    cdef const char* t5xxl_ptr = NULL
+    cdef const char* diffusion_ptr = NULL
+    cdef const char* vae_ptr = NULL
+    cdef const char* rules_ptr = NULL
+
+    if model_path:
+        model_bytes = model_path.encode('utf-8')
+        model_ptr = model_bytes
+    if clip_l_path:
+        clip_l_bytes = clip_l_path.encode('utf-8')
+        clip_l_ptr = clip_l_bytes
+    if clip_g_path:
+        clip_g_bytes = clip_g_path.encode('utf-8')
+        clip_g_ptr = clip_g_bytes
+    if t5xxl_path:
+        t5xxl_bytes = t5xxl_path.encode('utf-8')
+        t5xxl_ptr = t5xxl_bytes
+    if diffusion_model_path:
+        diffusion_bytes = diffusion_model_path.encode('utf-8')
+        diffusion_ptr = diffusion_bytes
+    if vae_path:
+        vae_bytes = vae_path.encode('utf-8')
+        vae_ptr = vae_bytes
+    if tensor_type_rules:
+        rules_bytes = tensor_type_rules.encode('utf-8')
+        rules_ptr = rules_bytes
+
+    if n_threads < 0:
+        n_threads = sd_get_num_physical_cores()
+
+    cdef bint success = convert_with_components(
+        model_ptr,
+        clip_l_ptr,
+        clip_g_ptr,
+        t5xxl_ptr,
+        diffusion_ptr,
+        vae_ptr,
+        output_bytes,
+        <sd_type_t>output_type,
+        rules_ptr,
+        convert_name,
+        n_threads
+    )
+
+    if not success:
+        raise RuntimeError(f"Model conversion failed -> {output_path}")
+
+    return True
+
+
+# =============================================================================
+# Importance matrix (imatrix) collection
+# =============================================================================
+
+def load_imatrix(imatrix_path: str) -> bool:
+    """Load an importance matrix from disk for use during quantization.
+
+    Returns True if the file was loaded successfully.
+    """
+    if not os.path.exists(imatrix_path):
+        raise FileNotFoundError(f"imatrix file not found: {imatrix_path}")
+    cdef bytes path_bytes = imatrix_path.encode('utf-8')
+    return c_load_imatrix(path_bytes)
+
+
+def save_imatrix(imatrix_path: str) -> None:
+    """Save the currently collected importance matrix to disk."""
+    cdef bytes path_bytes = imatrix_path.encode('utf-8')
+    c_save_imatrix(path_bytes)
+
+
+def enable_imatrix_collection() -> None:
+    """Start collecting importance-matrix statistics during generation."""
+    c_enable_imatrix_collection()
+
+
+def disable_imatrix_collection() -> None:
+    """Stop collecting importance-matrix statistics."""
+    c_disable_imatrix_collection()
+
+
+# =============================================================================
+# Backend device enumeration
+# =============================================================================
+
+def list_devices() -> list[tuple[str, str]]:
+    """List available ggml backend devices.
+
+    Returns a list of ``(name, description)`` tuples. The ``name`` values are
+    the device names accepted by the ``backend`` / ``params_backend`` context
+    parameters (and the ``split_mode`` per-module assignment specs).
+    """
+    cdef size_t needed = sd_list_devices(NULL, 0)
+    if needed == 0:
+        return []
+    # +1 for the NUL terminator, which sd_list_devices excludes from the count.
+    cdef size_t buf_size = needed + 1
+    cdef char* buf = <char*>malloc(buf_size)
+    if buf == NULL:
+        raise MemoryError("Failed to allocate buffer for device list")
+    try:
+        sd_list_devices(buf, buf_size)
+        raw = buf[:needed].decode('utf-8')
+    finally:
+        free(buf)
+
+    devices = []
+    for line in raw.splitlines():
+        if not line:
+            continue
+        name, _, description = line.partition('\t')
+        devices.append((name, description))
+    return devices
 
 
 # =============================================================================
@@ -3316,9 +3886,6 @@ def text_to_images(
     vae_tiling: bool = False,
     hires_fix: bool = False,
     hires_scale: float = 2.0,
-    offload_to_cpu: bool = False,
-    keep_clip_on_cpu: bool = False,
-    keep_vae_on_cpu: bool = False,
     diffusion_flash_attn: bool = False
 ) -> List[SDImage]:
     """
@@ -3354,9 +3921,6 @@ def text_to_images(
         vae_tiling: Enable VAE tiling for large images
         hires_fix: Enable hires-fix two-pass generation (latent upscale)
         hires_scale: Hires-fix upscale factor (default 2.0)
-        offload_to_cpu: Offload model to CPU (low VRAM)
-        keep_clip_on_cpu: Keep CLIP on CPU
-        keep_vae_on_cpu: Keep VAE on CPU
         diffusion_flash_attn: Use flash attention
 
     Returns:
@@ -3376,9 +3940,6 @@ def text_to_images(
         params.taesd_path = taesd_path
     if control_net_path:
         params.control_net_path = control_net_path
-    params.offload_params_to_cpu = offload_to_cpu
-    params.keep_clip_on_cpu = keep_clip_on_cpu
-    params.keep_vae_on_cpu = keep_vae_on_cpu
     params.diffusion_flash_attn = diffusion_flash_attn
 
     with SDContext(params) as ctx:
@@ -3426,9 +3987,6 @@ def text_to_image(
     vae_tiling: bool = False,
     hires_fix: bool = False,
     hires_scale: float = 2.0,
-    offload_to_cpu: bool = False,
-    keep_clip_on_cpu: bool = False,
-    keep_vae_on_cpu: bool = False,
     diffusion_flash_attn: bool = False
 ) -> SDImage:
     """
@@ -3461,9 +4019,6 @@ def text_to_image(
         vae_tiling: Enable VAE tiling for large images
         hires_fix: Enable hires-fix two-pass generation (latent upscale)
         hires_scale: Hires-fix upscale factor (default 2.0)
-        offload_to_cpu: Offload model to CPU (low VRAM)
-        keep_clip_on_cpu: Keep CLIP on CPU
-        keep_vae_on_cpu: Keep VAE on CPU
         diffusion_flash_attn: Use flash attention
 
     Returns:
@@ -3494,9 +4049,6 @@ def text_to_image(
         vae_tiling=vae_tiling,
         hires_fix=hires_fix,
         hires_scale=hires_scale,
-        offload_to_cpu=offload_to_cpu,
-        keep_clip_on_cpu=keep_clip_on_cpu,
-        keep_vae_on_cpu=keep_vae_on_cpu,
         diffusion_flash_attn=diffusion_flash_attn,
     )[0]
 
@@ -3545,7 +4097,6 @@ def image_to_image(
         model_path=model_path,
         vae_path=vae_path,
         n_threads=n_threads,
-        vae_decode_only=False  # Need encoder for img2img
     )
 
     with SDContext(params) as ctx:

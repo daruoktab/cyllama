@@ -115,7 +115,11 @@ cdef extern from "llama.h":
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38   # except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39   # except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40   # except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q2_0          = 41   # except 1d tensors
         LLAMA_FTYPE_GUESSED              = 1024
+
+    # Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
+    cdef const char * llama_ftype_name(llama_ftype ftype)
 
     cdef enum llama_rope_scaling_type:
         LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED = -1
@@ -150,6 +154,16 @@ cdef extern from "llama.h":
         LLAMA_SPLIT_MODE_LAYER  = 1 # split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2 # split layers and KV across GPUs, use tensor parallelism if supported
         LLAMA_SPLIT_MODE_TENSOR = 3
+
+    cdef enum llama_load_mode:
+        LLAMA_LOAD_MODE_NONE       = 0 # no special loading mode
+        LLAMA_LOAD_MODE_MMAP       = 1 # memory map the model
+        LLAMA_LOAD_MODE_MLOCK      = 2 # force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_MMAP_MLOCK = 3 # mmap + force system to keep model in RAM rather than swapping or compressing
+        LLAMA_LOAD_MODE_DIRECT_IO  = 4 # use direct I/O if available
+
+    const char * llama_load_mode_name(llama_load_mode load_mode)
+    llama_load_mode llama_load_mode_from_str(const char * str)
 
     cdef enum llama_context_type:
         LLAMA_CONTEXT_TYPE_DEFAULT = 0
@@ -233,7 +247,8 @@ cdef extern from "llama.h":
         const llama_model_tensor_buft_override * tensor_buft_overrides;
         int32_t n_gpu_layers           # number of layers to store in VRAM
         llama_split_mode split_mode    # how to split the model across multiple GPUs
-        int32_t main_gpu               # the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
+        llama_load_mode load_mode      # how to load the model
+        int32_t main_gpu             # the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         const float * tensor_split     # proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         # Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         # If the provided progress_callback returns true, model loading continues.
@@ -243,9 +258,6 @@ cdef extern from "llama.h":
         const llama_model_kv_override * kv_overrides
         # Keep the booleans together to avoid misalignment during copy-by-value.
         bint vocab_only       # only load the vocabulary, no weights
-        bint use_mmap         # use mmap if possible
-        bint use_direct_io    # use direct io, takes precedence over use_mmap when supported
-        bint use_mlock        # force system to keep model in RAM
         bint check_tensors    # validate model tensor data
         bint use_extra_bufts  # use extra buffer types (used for weight repacking)
         bint no_host          # bypass host buffer allowing extra buffers to be used
@@ -423,6 +435,7 @@ cdef extern from "llama.h":
     cdef int32_t llama_model_n_embd_inp (const llama_model * model)
     cdef int32_t llama_model_n_embd_out (const llama_model * model)
     cdef int32_t llama_model_n_layer    (const llama_model * model)
+    cdef int32_t llama_model_n_layer_nextn(const llama_model * model)
     cdef int32_t llama_model_n_head     (const llama_model * model)
     cdef int32_t llama_model_n_head_kv  (const llama_model * model)
     cdef int32_t llama_model_n_swa      (const llama_model * model)
@@ -464,6 +477,9 @@ cdef extern from "llama.h":
 
     # Get a string describing the model type
     cdef int32_t llama_model_desc(const llama_model * model, char * buf, size_t buf_size)
+
+    # Get the model file type (quantization), e.g. LLAMA_FTYPE_MOSTLY_Q8_0
+    cdef llama_ftype llama_model_ftype(const llama_model * model)
 
     # Returns the total size of all the tensors in the model in bytes
     cdef uint64_t llama_model_size(const llama_model * model)
@@ -892,6 +908,9 @@ cdef extern from "llama.h":
     cdef bint llama_vocab_get_add_eos(const llama_vocab * vocab)
     cdef bint llama_vocab_get_add_sep(const llama_vocab * vocab)
 
+    # model-specific suppress tokens (gguf key: tokenizer.ggml.suppress_tokens)
+    cdef const llama_token * llama_vocab_get_suppress_tokens(const llama_vocab * vocab, int32_t * n_suppress_tokens)
+
     cdef llama_token llama_vocab_fim_pre(const llama_vocab * vocab)
     cdef llama_token llama_vocab_fim_suf(const llama_vocab * vocab)
     cdef llama_token llama_vocab_fim_mid(const llama_vocab * vocab)
@@ -1139,10 +1158,11 @@ cdef extern from "llama.h":
 
     # NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     cdef llama_sampler * llama_sampler_init_penalties(
+                             int32_t   n_vocab,
                              int32_t   penalty_last_n,   # last n tokens to penalize (0 = disable penalty, -1 = context size)
-                               float   penalty_repeat,   # 1.0 = disabled
-                               float   penalty_freq,     # 0.0 = disabled
-                               float   penalty_present)  # 0.0 = disabled
+                               float   penalty_repeat,   # must be > 0.0, 1.0 = disabled
+                               float   penalty_freq,     # must be finite, 0.0 = disabled
+                               float   penalty_present)  # must be finite, 0.0 = disabled
 
     # @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     cdef llama_sampler * llama_sampler_init_dry(

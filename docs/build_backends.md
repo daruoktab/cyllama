@@ -117,7 +117,7 @@ These flags apply uniformly to all components (llama.cpp, whisper.cpp, stable-di
 | `GGML_SYCL` | `0` | Intel SYCL (oneAPI) |
 | `GGML_HIP` | `0` | AMD ROCm/HIP |
 | `GGML_OPENCL` | `0` | OpenCL (Adreno, mobile GPUs) |
-| `SD_USE_VENDORED_GGML` | `1` | Link stable-diffusion against its own vendored ggml (set to `0` to share llama.cpp's ggml; not recommended for GPU backends) |
+| `SD_USE_VENDORED_GGML` | `0` | Share llama.cpp's ggml with stable-diffusion (set to `1` to link SD's own vendored copy instead) |
 
 ## Backend Requirements
 
@@ -416,6 +416,7 @@ Approximate relative performance (inference speed):
 Cyllama has a two-stage build process:
 
 1. **Dependency build** (`scripts/manage.py`): Builds llama.cpp, whisper.cpp, stable-diffusion.cpp as static libraries
+
 2. **Extension build** (`CMakeLists.txt`): Builds Cython extensions with scikit-build-core, linking against the static libraries
 
 ### Customizing Dependency Build

@@ -7,9 +7,13 @@ llama.cpp is built from source via `manage.py`, producing `.a` archives that are
 ### Build Flow
 
 1. `manage.py` clones llama.cpp at a pinned commit (currently `b8522`)
+
 2. CMake builds static libraries (`libllama.a`, `libggml*.a`, `libcommon.a`, etc.)
+
 3. Libraries and ~56 headers are copied to `thirdparty/llama.cpp/{lib,include}/`
+
 4. scikit-build-core runs the root `CMakeLists.txt`, which:
+
    - Transpiles `.pyx` to `.cxx` via Cython
 
    - Compiles `.cxx` to `.o`
@@ -278,7 +282,9 @@ The public API now has **15+ sampler init functions** covering all sampler types
 **Replacement strategy options**:
 
 1. **Reimplement in Python**: Use public `llama_decode()`, `llama_memory_seq_rm/cp()`, and sampler APIs to orchestrate the draft-verify loop. Feasible but significant effort.
+
 2. **Keep as optional C++ dependency**: Build only `libcommon-speculative.a` from source for users who need this feature.
+
 3. **Drop feature**: If speculative decoding is not a core use case.
 
 **Effort**: High. ~500 lines of algorithmic C++ to reimplement, with subtle correctness requirements around KV cache state management.
@@ -559,7 +565,7 @@ WITH_DYLIB=1 LLAMACPP_DYLIB_DIR=/path/to/llama-b8522 make build
 
 - `LLAMACPP_DYLIB_DIR=/path/to/release` -- directory containing pre-built shared libraries
 
-- `SD_USE_VENDORED_GGML=ON` (default) -- link stable-diffusion against its own vendored ggml; set to `OFF` to share llama.cpp's ggml (not recommended for GPU backends)
+- `SD_USE_VENDORED_GGML=OFF` (default) -- stable-diffusion shares llama.cpp's ggml; set to `ON` to link SD's own vendored copy instead
 
 **How it works**:
 
@@ -571,7 +577,7 @@ WITH_DYLIB=1 LLAMACPP_DYLIB_DIR=/path/to/llama-b8522 make build
 
 - Shared libraries copied alongside extension modules (`cyllama/llama/`) so `@loader_path`/`$ORIGIN` RPATH resolves correctly
 
-- Whisper and Stable Diffusion remain statically linked (no pre-built releases available). Stable Diffusion uses its own vendored ggml by default; set `SD_USE_VENDORED_GGML=0` to share llama.cpp's ggml (not recommended for GPU backends due to ggml version incompatibilities)
+- Whisper and Stable Diffusion remain statically linked (no pre-built releases available). Stable Diffusion shares llama.cpp's ggml by default, with `_sync_ggml_abi()` overlaying llama.cpp's ggml source onto SD before compilation so both sides agree on enum ordinals and `GGML_MAX_NAME`; set `SD_USE_VENDORED_GGML=1` to link SD's own vendored copy instead
 
 **Validated results** (macOS arm64, b8522 release):
 
@@ -589,11 +595,9 @@ Analysis of the `dev` branch changes since v0.1.21 (`main`), covering 11 commits
 
 ### Pros of merging
 
-**1. Eliminates internal C++ API fragility (the biggest win)**
-The branch removes all `common.h`/`libcommon` dependencies (~4200 lines deleted across `.pxd`/`.pxi` files). The extension now uses only public C APIs (`llama.h`, `ggml.h`, `gguf.h`, `mtmd.h`). This decouples cyllama from llama.cpp internals that break between releases, making future upstream version bumps significantly safer.
+**1. Eliminates internal C++ API fragility (the biggest win)** The branch removes all `common.h`/`libcommon` dependencies (~4200 lines deleted across `.pxd`/`.pxi` files). The extension now uses only public C APIs (`llama.h`, `ggml.h`, `gguf.h`, `mtmd.h`). This decouples cyllama from llama.cpp internals that break between releases, making future upstream version bumps significantly safer.
 
-**2. Enables dynamic linking**
-`WITH_DYLIB=1` is a new build mode that links against pre-built llama.cpp releases instead of compiling from source. Extension size drops from ~15 MB to ~1.6 MB, build time goes from minutes to seconds. This unblocks faster iteration and simpler CI.
+**2. Enables dynamic linking** `WITH_DYLIB=1` is a new build mode that links against pre-built llama.cpp releases instead of compiling from source. Extension size drops from ~15 MB to ~1.6 MB, build time goes from minutes to seconds. This unblocks faster iteration and simpler CI.
 
 **3. Build system consistency**
 
@@ -611,25 +615,19 @@ The branch removes all `common.h`/`libcommon` dependencies (~4200 lines deleted 
 
 - `_build_info.py` reporting wrong ggml version for SD
 
-**5. Cleaner test suite**
-Removed ~220 lines of tests for `CommonParams`/`CommonParamsSampling` that tested deleted wrapper classes. The remaining tests cover the actual public API.
+**5. Cleaner test suite** Removed ~220 lines of tests for `CommonParams`/`CommonParamsSampling` that tested deleted wrapper classes. The remaining tests cover the actual public API.
 
 ### Cons of merging
 
-**1. Large, multi-concern changeset**
-11 commits touching 63 files with +27,633 / -4,246 lines. Hard to review atomically or bisect if something regresses. The changes span: API refactor, build system overhaul, new build mode, vendored dependency, bug fixes. Ideally these would be separate PRs, but they're intertwined (e.g., public API refactor enables dynamic linking).
+**1. Large, multi-concern changeset** 11 commits touching 63 files with +27,633 / -4,246 lines. Hard to review atomically or bisect if something regresses. The changes span: API refactor, build system overhaul, new build mode, vendored dependency, bug fixes. Ideally these would be separate PRs, but they're intertwined (e.g., public API refactor enables dynamic linking).
 
-**2. Removed public Python API surface**
-`CommonParams`, `CommonParamsSampling`, `CommonSampler` are gone. Any downstream code using these classes will break. The replacements (`LlamaContextParams`, `LlamaSampler`) exist but the migration isn't documented beyond the changelog. This is a breaking change that warrants a minor version bump.
+**2. Removed public Python API surface** `CommonParams`, `CommonParamsSampling`, `CommonSampler` are gone. Any downstream code using these classes will break. The replacements (`LlamaContextParams`, `LlamaSampler`) exist but the migration isn't documented beyond the changelog. This is a breaking change that warrants a minor version bump.
 
-**3. Vendored sqlite-vector adds ~24K lines of C to the repo**
-The `thirdparty/sqlite-vector/` directory includes `sqlite3.h` (13,773 lines) and several SIMD distance implementations. This bloats the repo and creates a maintenance burden for keeping it in sync with upstream. The alternative (the pre-built binary approach) had its own problems, but the tradeoff is worth being explicit about.
+**3. Vendored sqlite-vector adds ~24K lines of C to the repo** The `thirdparty/sqlite-vector/` directory includes `sqlite3.h` (13,773 lines) and several SIMD distance implementations. This bloats the repo and creates a maintenance burden for keeping it in sync with upstream. The alternative (the pre-built binary approach) had its own problems, but the tradeoff is worth being explicit about.
 
-**4. Dynamic linking is new and lightly validated**
-The changelog says "120+ tests verified" for dynamic mode, but the test matrix for dynamic linking across platforms (Linux, macOS) and backends (CUDA, Vulkan) is likely thin. A regression in dynamic mode could be hard to catch without CI coverage.
+**4. Dynamic linking is new and lightly validated** The changelog says "120+ tests verified" for dynamic mode, but the test matrix for dynamic linking across platforms (Linux, macOS) and backends (CUDA, Vulkan) is likely thin. A regression in dynamic mode could be hard to catch without CI coverage.
 
-**5. `SD_USE_VENDORED_GGML` adds configuration complexity**
-A build option with interactions across static/dynamic modes, multiple backends, and two different ggml versions. Now defaults to ON (vendored) after CUDA image generation crashes were traced to ggml version incompatibilities between llama.cpp and stable-diffusion.cpp. The shared-ggml path (`SD_USE_VENDORED_GGML=0`) remains available but is not recommended for GPU backends.
+**5. `SD_USE_VENDORED_GGML` adds configuration complexity** A build option with interactions across static/dynamic modes, multiple backends, and two different ggml versions. It briefly defaulted to ON (vendored) after CUDA image generation crashes were traced to ggml version incompatibilities between llama.cpp and stable-diffusion.cpp; `_sync_ggml_abi()` and the `GGML_MAX_NAME=128` propagation addressed the root cause, and the default is now OFF (shared). `SD_USE_VENDORED_GGML=1` still pins SD to its own copy.
 
 ### Recommendation
 

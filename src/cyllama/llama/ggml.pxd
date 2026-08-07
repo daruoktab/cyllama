@@ -87,7 +87,8 @@ cdef extern from "ggml.h":
         GGML_TYPE_MXFP4 = 39 # MXFP4 (1 block)
         GGML_TYPE_NVFP4 = 40 # NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0 = 41
-        GGML_TYPE_COUNT = 42
+        GGML_TYPE_Q2_0 = 42
+        GGML_TYPE_COUNT = 43
 
 
     cdef enum ggml_prec:
@@ -186,6 +187,10 @@ cdef extern from "ggml.h":
         GGML_OP_RWKV_WKV7
         GGML_OP_SOLVE_TRI
         GGML_OP_GATED_DELTA_NET
+        GGML_OP_LIGHTNING_INDEXER
+        GGML_OP_DSV4_HC_COMB
+        GGML_OP_DSV4_HC_PRE
+        GGML_OP_DSV4_HC_POST
 
         GGML_OP_UNARY
 
@@ -528,6 +533,7 @@ cdef extern from "ggml-cpu.h":
     cdef int ggml_cpu_has_sve        ()
     cdef int ggml_cpu_get_sve_cnt    ()  # sve vector length in bytes
     cdef int ggml_cpu_has_sme        ()
+    cdef int ggml_cpu_has_sme2       ()
     # other
     cdef int ggml_cpu_has_riscv_v    ()
     cdef int ggml_cpu_has_vsx        ()

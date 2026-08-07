@@ -19,6 +19,7 @@ from cyllama.sd import (
     SampleMethod,
     Scheduler,
     Prediction,
+    CancelMode,
     SDType,
     LogLevel,
     PreviewMode,
@@ -29,9 +30,15 @@ from cyllama.sd import (
     text_to_images,
     image_to_image,
     convert_model,
+    convert_model_with_components,
     canny_preprocess,
+    load_imatrix,
+    save_imatrix,
+    enable_imatrix_collection,
+    disable_imatrix_collection,
     get_num_cores,
     get_system_info,
+    list_devices,
     type_name,
     sample_method_name,
     scheduler_name,
@@ -74,6 +81,20 @@ class TestEnums:
         assert VaeFormat.FLUX.value == 0
         assert VaeFormat.SD3.value == 1
         assert VaeFormat.FLUX2.value == 2
+        assert VaeFormat.WAN.value == 3
+
+    def test_scheduler_logit_normal(self):
+        # Added upstream in master-731.
+        assert Scheduler.LOGIT_NORMAL.value < Scheduler.COUNT.value
+
+    def test_prediction_sefi_flow(self):
+        # Added upstream in master-731.
+        assert Prediction.SEFI_FLOW.value < Prediction.COUNT.value
+
+    def test_cancel_mode(self):
+        assert CancelMode.ALL.value == 0
+        assert CancelMode.NEW_LATENTS.value == 1
+        assert CancelMode.RESET.value == 2
 
 
 class TestUtilityFunctions:
@@ -376,7 +397,6 @@ class TestSDContextParams:
     def test_default_init(self):
         params = SDContextParams()
         assert params.n_threads > 0 or params.n_threads == -1
-        assert params.vae_decode_only is True
 
     def test_model_path(self):
         params = SDContextParams()
@@ -418,6 +438,47 @@ class TestSDContextParams:
         assert params.stream_layers is False
         params.stream_layers = True
         assert params.stream_layers is True
+
+    def test_eager_load_default_and_setter(self):
+        params = SDContextParams()
+        assert params.eager_load is False
+        params.eager_load = True
+        assert params.eager_load is True
+
+    def test_max_vram_default_and_setter(self):
+        params = SDContextParams()
+        assert params.max_vram is None
+        params.max_vram = "-1"
+        assert params.max_vram == "-1"
+        # numeric values are coerced to their string form
+        params.max_vram = 4
+        assert params.max_vram == "4"
+        params.max_vram = None
+        assert params.max_vram is None
+
+    def test_pulid_weights_path(self):
+        params = SDContextParams()
+        assert params.pulid_weights_path is None
+        params.pulid_weights_path = "/path/to/pulid.safetensors"
+        assert params.pulid_weights_path == "/path/to/pulid.safetensors"
+        params.pulid_weights_path = None
+        assert params.pulid_weights_path is None
+
+    def test_rpc_servers(self):
+        params = SDContextParams()
+        assert params.rpc_servers is None
+        params.rpc_servers = "127.0.0.1:50052"
+        assert params.rpc_servers == "127.0.0.1:50052"
+        params.rpc_servers = None
+        assert params.rpc_servers is None
+
+    def test_split_mode(self):
+        params = SDContextParams()
+        assert params.split_mode is None
+        params.split_mode = "diffusion=row"
+        assert params.split_mode == "diffusion=row"
+        params.split_mode = None
+        assert params.split_mode is None
 
 
 class TestSDSampleParams:
@@ -475,6 +536,20 @@ class TestSDImageGenParams:
         assert params.height == 256
         assert params.seed == 123
 
+    def test_circular_x(self):
+        # Circular padding (tileable generation) moved from the context params
+        # onto the per-generation params upstream.
+        params = SDImageGenParams()
+        assert params.circular_x is False
+        params.circular_x = True
+        assert params.circular_x is True
+
+    def test_circular_y(self):
+        params = SDImageGenParams()
+        assert params.circular_y is False
+        params.circular_y = True
+        assert params.circular_y is True
+
 
 class TestCallbacks:
     """Test callback functions."""
@@ -519,6 +594,37 @@ class TestSDContextIntegration:
 
         ctx = sd_ctx_factory(params)
         assert ctx.is_valid
+
+    def test_control_net_api(self, sd_ctx_factory):
+        # Exercise the ControlNet hot-swap bindings within a single context
+        # lifecycle (Metal working-set discipline). No ControlNet weights are
+        # loaded, so this covers the default/guard paths.
+        params = SDContextParams()
+        params.model_path = MODEL_PATH
+        params.n_threads = 4
+
+        ctx = sd_ctx_factory(params)
+
+        # Nothing loaded on a fresh context.
+        assert ctx.has_control_net is False
+
+        # A missing path is rejected before touching native code.
+        with pytest.raises(FileNotFoundError):
+            ctx.load_control_net("does/not/exist.gguf")
+
+        # Unloading when none is loaded must not raise and returns a bool.
+        assert isinstance(ctx.unload_control_net(), bool)
+        assert ctx.has_control_net is False
+
+    def test_cancel_reset_is_safe(self, sd_ctx_factory):
+        # With no generation in flight, RESET just clears any pending
+        # cancellation request and must not raise.
+        params = SDContextParams()
+        params.model_path = MODEL_PATH
+        params.n_threads = 4
+
+        ctx = sd_ctx_factory(params)
+        ctx.cancel(CancelMode.RESET)
 
     def test_generate_image(self, sd_ctx_factory):
         params = SDContextParams()
@@ -783,13 +889,6 @@ class TestSDContextParamsExtended:
         params.t5xxl_path = "/path/to/t5xxl.safetensors"
         assert params.t5xxl_path == "/path/to/t5xxl.safetensors"
 
-    def test_vae_decode_only(self):
-        params = SDContextParams()
-        params.vae_decode_only = False
-        assert params.vae_decode_only is False
-        params.vae_decode_only = True
-        assert params.vae_decode_only is True
-
     def test_diffusion_flash_attn(self):
         params = SDContextParams()
         params.diffusion_flash_attn = True
@@ -804,11 +903,6 @@ class TestSDContextParamsExtended:
         params = SDContextParams()
         params.diffusion_model_path = "/path/to/diffusion.safetensors"
         assert params.diffusion_model_path == "/path/to/diffusion.safetensors"
-
-    def test_offload_params_to_cpu(self):
-        params = SDContextParams()
-        params.offload_params_to_cpu = True
-        assert params.offload_params_to_cpu is True
 
     def test_clip_vision_path(self):
         params = SDContextParams()
@@ -835,6 +929,18 @@ class TestSDContextParamsExtended:
         params.control_net_path = "/path/to/controlnet.gguf"
         assert params.control_net_path == "/path/to/controlnet.gguf"
 
+    def test_ip_adapter_path(self):
+        params = SDContextParams()
+        assert params.ip_adapter_path is None
+        params.ip_adapter_path = "/path/to/ip-adapter.safetensors"
+        assert params.ip_adapter_path == "/path/to/ip-adapter.safetensors"
+
+    def test_motion_module_path(self):
+        params = SDContextParams()
+        assert params.motion_module_path is None
+        params.motion_module_path = "/path/to/motion-module.safetensors"
+        assert params.motion_module_path == "/path/to/motion-module.safetensors"
+
     def test_photo_maker_path(self):
         params = SDContextParams()
         params.photo_maker_path = "/path/to/photomaker.bin"
@@ -860,21 +966,6 @@ class TestSDContextParamsExtended:
         params.lora_apply_mode = LoraApplyMode.IMMEDIATELY
         assert params.lora_apply_mode == LoraApplyMode.IMMEDIATELY
 
-    def test_keep_clip_on_cpu(self):
-        params = SDContextParams()
-        params.keep_clip_on_cpu = True
-        assert params.keep_clip_on_cpu is True
-
-    def test_keep_vae_on_cpu(self):
-        params = SDContextParams()
-        params.keep_vae_on_cpu = True
-        assert params.keep_vae_on_cpu is True
-
-    def test_keep_control_net_on_cpu(self):
-        params = SDContextParams()
-        params.keep_control_net_on_cpu = True
-        assert params.keep_control_net_on_cpu is True
-
     def test_diffusion_conv_direct(self):
         params = SDContextParams()
         params.diffusion_conv_direct = True
@@ -895,20 +986,21 @@ class TestSDContextParamsExtended:
         params.flow_shift = 1.5
         assert abs(params.flow_shift - 1.5) < 0.001
 
-    def test_chroma_use_dit_mask(self):
+    def test_model_args(self):
+        # Chroma / Qwen-Image tuning knobs are now passed through the
+        # model_args key=value string (upstream folded the dedicated struct
+        # fields into it).
         params = SDContextParams()
-        params.chroma_use_dit_mask = False
-        assert params.chroma_use_dit_mask is False
+        assert params.model_args is None
+        params.model_args = "chroma_use_dit_mask=0,chroma_t5_mask_pad=10"
+        assert params.model_args == "chroma_use_dit_mask=0,chroma_t5_mask_pad=10"
+        params.model_args = None
+        assert params.model_args is None
 
-    def test_chroma_use_t5_mask(self):
+    def test_auto_fit(self):
         params = SDContextParams()
-        params.chroma_use_t5_mask = True
-        assert params.chroma_use_t5_mask is True
-
-    def test_chroma_t5_mask_pad(self):
-        params = SDContextParams()
-        params.chroma_t5_mask_pad = 10
-        assert params.chroma_t5_mask_pad == 10
+        params.auto_fit = True
+        assert params.auto_fit is True
 
 
 class TestSDSampleParamsExtended:
@@ -1002,6 +1094,26 @@ class TestSDImageGenParamsExtended:
         params.clip_skip = 2
         assert params.clip_skip == 2
 
+    def test_qwen_image_layers(self):
+        params = SDImageGenParams()
+        # Default comes from sd_img_gen_params_init(); just check round-trip.
+        params.qwen_image_layers = 8
+        assert params.qwen_image_layers == 8
+        params.qwen_image_layers = 0
+        assert params.qwen_image_layers == 0
+
+    def test_pulid_params(self):
+        params = SDImageGenParams()
+        assert params.pulid_id_embedding_path is None
+        params.pulid_id_embedding_path = "/path/to/id_embedding.bin"
+        assert params.pulid_id_embedding_path == "/path/to/id_embedding.bin"
+        params.pulid_id_weight = 0.8
+        assert abs(params.pulid_id_weight - 0.8) < 1e-6
+        # Clearing the path resets it to None without disturbing the weight.
+        params.pulid_id_embedding_path = None
+        assert params.pulid_id_embedding_path is None
+        assert abs(params.pulid_id_weight - 0.8) < 1e-6
+
     def test_set_init_image(self):
         """Test setting init image."""
         params = SDImageGenParams()
@@ -1022,6 +1134,14 @@ class TestSDImageGenParamsExtended:
         params.set_control_image(img, strength=0.8)
         # set_control_image also stores the strength, which is readable.
         assert abs(params.control_strength - 0.8) < 1e-6
+
+    def test_set_ip_adapter_image(self):
+        """Test setting the IP-Adapter reference image."""
+        params = SDImageGenParams()
+        arr = np.zeros((64, 64, 3), dtype=np.uint8)
+        img = SDImage.from_numpy(arr)
+        params.set_ip_adapter_image(img, strength=0.5)
+        assert abs(params.ip_adapter_strength - 0.5) < 1e-6
 
     def test_sample_params(self):
         """Test accessing sample_params."""
@@ -1069,10 +1189,30 @@ class TestSDImageGenParamsExtended:
         assert abs(start - 0.1) < 0.001
         assert abs(end - 0.9) < 0.001
 
-    def test_auto_resize_ref_image(self):
+    def test_ref_image_args(self):
         params = SDImageGenParams()
-        params.auto_resize_ref_image = True
-        assert params.auto_resize_ref_image is True
+        assert params.ref_image_args == ""
+        params.ref_image_args = "resize_before_vae=0,ref_index_mode=increase"
+        assert params.ref_image_args == "resize_before_vae=0,ref_index_mode=increase"
+        # Re-setting replaces rather than appends, and the kept-alive bytes
+        # buffer must follow the new value.
+        params.ref_image_args = "preset=default,vlm_size=512"
+        assert params.ref_image_args == "preset=default,vlm_size=512"
+        params.ref_image_args = ""
+        assert params.ref_image_args == ""
+
+    def test_removed_ref_image_flags(self):
+        """The pre-master-795 booleans are gone; use ref_image_args instead."""
+        params = SDImageGenParams()
+        for attr in ("auto_resize_ref_image", "increase_ref_index"):
+            assert not hasattr(params, attr)
+            with pytest.raises(AttributeError):
+                setattr(params, attr, True)
+
+    def test_ip_adapter_strength(self):
+        params = SDImageGenParams()
+        params.ip_adapter_strength = 0.6
+        assert abs(params.ip_adapter_strength - 0.6) < 0.001
 
     def test_hires_defaults(self):
         params = SDImageGenParams()
@@ -1223,12 +1363,12 @@ class TestEnumsExtended:
     def test_prediction_enum(self):
         """Test Prediction enum values."""
         assert Prediction.EPS.value == 0
-        assert len(list(Prediction)) >= 6  # Includes FLUX2_FLOW
+        assert len(list(Prediction)) >= 6  # Includes MINIT2I_FLOW
         # Verify key prediction types exist
         assert hasattr(Prediction, "EPS")
         assert hasattr(Prediction, "V")
         assert hasattr(Prediction, "FLUX_FLOW")
-        assert hasattr(Prediction, "FLUX2_FLOW")
+        assert hasattr(Prediction, "MINIT2I_FLOW")
 
     def test_log_level_enum(self):
         """Test LogLevel enum values."""
@@ -1337,6 +1477,50 @@ class TestConvertModel:
             convert_model(
                 input_path="/nonexistent/model.safetensors", output_path="/tmp/output.gguf", output_type=SDType.F16
             )
+
+    def test_convert_with_components_requires_a_component(self):
+        """convert_model_with_components rejects an all-None component set."""
+        with pytest.raises(ValueError):
+            convert_model_with_components(output_path="/tmp/output.gguf", output_type=SDType.F16)
+
+    def test_convert_with_components_missing_file(self):
+        """A provided-but-missing component path raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError):
+            convert_model_with_components(
+                output_path="/tmp/output.gguf",
+                diffusion_model_path="/nonexistent/diffusion.safetensors",
+            )
+
+
+class TestImatrixAndDevices:
+    """Test imatrix collection helpers and backend device enumeration."""
+
+    def test_list_devices(self):
+        """list_devices returns (name, description) tuples for real backends."""
+        devices = list_devices()
+        assert isinstance(devices, list)
+        # At least a CPU backend is always present.
+        assert len(devices) >= 1
+        for entry in devices:
+            assert isinstance(entry, tuple) and len(entry) == 2
+            name, description = entry
+            assert isinstance(name, str) and name
+            assert isinstance(description, str)
+        assert any(name == "CPU" for name, _ in devices)
+
+    def test_imatrix_collection_toggle(self):
+        """Enabling/disabling imatrix collection is a safe no-op toggle."""
+        enable_imatrix_collection()
+        disable_imatrix_collection()
+
+    def test_load_imatrix_missing_file(self):
+        """load_imatrix raises FileNotFoundError for a missing path."""
+        with pytest.raises(FileNotFoundError):
+            load_imatrix("/nonexistent/model.imatrix")
+
+    def test_save_imatrix_importable(self):
+        """save_imatrix is importable and callable."""
+        assert save_imatrix is not None
 
 
 class TestConvenienceFunctions:

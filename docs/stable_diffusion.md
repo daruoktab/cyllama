@@ -2,7 +2,7 @@
 
 Cyllama wraps [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) to provide image and video generation capabilities in Python.
 
-**Note**: Build with `WITH_STABLEDIFFUSION=1` to enable this module. By default, stable-diffusion.cpp statically links its own vendored ggml. To share llama.cpp's ggml instead (not recommended for GPU backends), set `SD_USE_VENDORED_GGML=0`.
+**Note**: Build with `WITH_STABLEDIFFUSION=1` to enable this module. By default, stable-diffusion.cpp shares llama.cpp's ggml, so every extension runs the same ggml version. To link SD's own vendored ggml instead, set `SD_USE_VENDORED_GGML=1`.
 
 ## Overview
 
@@ -96,9 +96,6 @@ def text_to_image(
     vae_tiling: bool = False,
     hires_fix: bool = False,
     hires_scale: float = 2.0,
-    offload_to_cpu: bool = False,
-    keep_clip_on_cpu: bool = False,
-    keep_vae_on_cpu: bool = False,
     diffusion_flash_attn: bool = False
 ) -> List[SDImage]
 ```
@@ -123,7 +120,6 @@ def text_to_image(
 | `vae_tiling` | bool | False | Enable VAE tiling for large images |
 | `hires_fix` | bool | False | Enable hires-fix two-pass generation (latent upscale) |
 | `hires_scale` | float | 2.0 | Hires-fix upscale factor |
-| `offload_to_cpu` | bool | False | Offload weights to CPU (low VRAM) |
 | `diffusion_flash_attn` | bool | False | Use flash attention |
 
 #### image_to_image()
@@ -218,13 +214,14 @@ params.prediction = Prediction.COUNT          # Prediction type (COUNT = auto-de
 params.lora_apply_mode = LoraApplyMode.AUTO   # LoRA application mode
 params.chroma_t5_mask_pad = 0                 # Chroma T5 mask pad
 
+# Memory placement (replaces the removed per-component CPU-offload flags)
+params.max_vram = "-1"                        # "0" off, "-1" auto, or GiB budget / backend spec
+params.eager_load = False                     # Load all params at load time, not lazily
+params.pulid_weights_path = None              # Optional PuLID weights
+params.rpc_servers = None                     # Optional RPC backends "host:port,..."
+
 # Boolean flags
-params.vae_decode_only = True                 # VAE decode only (faster)
 params.enable_mmap = True                     # Enable memory-mapped loading
-params.offload_params_to_cpu = False          # Offload to CPU (low VRAM)
-params.keep_clip_on_cpu = False               # Keep CLIP on CPU
-params.keep_vae_on_cpu = False                # Keep VAE on CPU
-params.keep_control_net_on_cpu = False        # Keep ControlNet on CPU
 params.diffusion_flash_attn = False           # Flash attention
 params.diffusion_conv_direct = False          # Direct convolution
 params.vae_conv_direct = False                # VAE direct convolution
@@ -321,6 +318,15 @@ params.set_mask_image(mask_img)
 # Set control image for ControlNet
 params.set_control_image(control_img, strength=0.8)
 
+# Identity customization
+# Photo Maker (requires SDContextParams.photo_maker_path):
+params.set_pm_id_images([SDImage.load("face1.png"), SDImage.load("face2.png")])
+params.pm_id_embed_path = "/path/to/id_embed.bin"  # optional precomputed embedding
+params.pm_style_strength = 20.0
+# PuLID (requires SDContextParams.pulid_weights_path):
+params.pulid_id_embedding_path = "/path/to/id_embedding.bin"
+params.pulid_id_weight = 1.0
+
 # Access sample parameters
 sample = params.sample_params
 sample.sample_steps = 20
@@ -368,7 +374,6 @@ from cyllama.sd import Upscaler, SDImage
 upscaler = Upscaler(
     "models/esrgan-x4.bin",
     n_threads=4,
-    offload_to_cpu=False,
     direct=False
 )
 
@@ -445,7 +450,8 @@ Prediction types:
 | `EDM_V` | EDM V-prediction |
 | `SD3_FLOW` | SD3 flow matching |
 | `FLUX_FLOW` | FLUX flow matching |
-| `FLUX2_FLOW` | FLUX2 flow matching |
+| `SEFI_FLOW` | SEFI flow matching |
+| `MINIT2I_FLOW` | MiniT2I flow matching |
 
 ### SDType
 
@@ -830,12 +836,19 @@ print(scheduler_name(Scheduler.KARRAS))  # "karras"
 ## Performance Tips
 
 1. **Use turbo models** for fast generation (1-4 steps, cfg_scale=1.0)
+
 2. **Quantize models** to Q4_0 or Q8_0 for memory efficiency
+
 3. **Reuse SDContext** when generating multiple images
+
 4. **Set n_threads** to match physical CPU cores
+
 5. **Use `--offload-to-cpu`** for low VRAM GPUs
+
 6. **Enable `--diffusion-fa`** (flash attention) for faster inference
+
 7. **Use `--vae-tiling`** for generating large images
+
 8. **Use progress callback** to track long generations
 
 ## Troubleshooting

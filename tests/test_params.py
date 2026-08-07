@@ -18,11 +18,42 @@ def test_default_model_params():
     assert params.split_mode == 1  # LLAMA_SPLIT_MODE_LAYER = 1
     assert params.main_gpu == 0
     assert params.vocab_only == False
-    assert params.use_mmap == True
-    assert params.use_mlock == False
+    assert params.load_mode == cy.LLAMA_LOAD_MODE_MMAP
+    assert params.load_mode_name == "mmap"
     assert params.check_tensors == False
     assert params.progress_callback is None
     assert params.tensor_split == []  # Default is empty (no custom split)
+
+
+def test_model_params_load_mode():
+    """load_mode replaces the removed use_mmap/use_mlock/use_direct_io fields."""
+    params = cy.LlamaModelParams()
+
+    assert cy.LLAMA_LOAD_MODE_NONE == 0
+    assert cy.LLAMA_LOAD_MODE_MMAP == 1
+    assert cy.LLAMA_LOAD_MODE_MLOCK == 2
+    assert cy.LLAMA_LOAD_MODE_MMAP_MLOCK == 3
+    assert cy.LLAMA_LOAD_MODE_DIRECT_IO == 4
+
+    for mode, name in [
+        (cy.LLAMA_LOAD_MODE_NONE, "none"),
+        (cy.LLAMA_LOAD_MODE_MMAP, "mmap"),
+        (cy.LLAMA_LOAD_MODE_MLOCK, "mlock"),
+        (cy.LLAMA_LOAD_MODE_MMAP_MLOCK, "mmap+mlock"),
+        (cy.LLAMA_LOAD_MODE_DIRECT_IO, "dio"),
+    ]:
+        params.load_mode = mode
+        assert params.load_mode == mode
+        assert params.load_mode_name == name
+
+
+def test_model_params_removed_load_flags():
+    """The pre-b10107 booleans are gone; load_mode is the only way to set this."""
+    params = cy.LlamaModelParams()
+    for attr in ("use_mmap", "use_mlock", "use_direct_io"):
+        assert not hasattr(params, attr)
+        with pytest.raises(AttributeError):
+            setattr(params, attr, True)
 
 
 def test_model_params_tensor_split():
@@ -164,8 +195,8 @@ def test_default_model_quantize_params():
     params = cy.LlamaModelQuantizeParams()
     assert params.nthread == 0
     assert params.ftype == 7  # LLAMA_FTYPE_MOSTLY_Q8_0 = 7
-    assert params.output_tensor_type == 42  # GGML_TYPE_COUNT = 42
-    assert params.token_embedding_type == 42  # GGML_TYPE_COUNT = 42
+    assert params.output_tensor_type == 43  # GGML_TYPE_COUNT = 43
+    assert params.token_embedding_type == 43  # GGML_TYPE_COUNT = 43
     assert params.allow_requantize == False
     assert params.quantize_output_tensor == True
     assert params.only_copy == False

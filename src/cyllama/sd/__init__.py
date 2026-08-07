@@ -71,6 +71,7 @@ from .stable_diffusion import (
     SampleMethod,
     Scheduler,
     Prediction,
+    CancelMode,
     SDType,
     LogLevel,
     PreviewMode,
@@ -83,12 +84,19 @@ from .stable_diffusion import (
     image_to_image,
     # Model utilities
     convert_model,
+    convert_model_with_components,
     canny_preprocess,
+    # Importance matrix (imatrix) collection
+    load_imatrix,
+    save_imatrix,
+    enable_imatrix_collection,
+    disable_imatrix_collection,
     # Backend loading
     ggml_backend_load_all,
     # Utility functions
     get_num_cores,
     get_system_info,
+    list_devices,
     type_name,
     sample_method_name,
     scheduler_name,
@@ -115,6 +123,7 @@ __all__ = [
     "SampleMethod",
     "Scheduler",
     "Prediction",
+    "CancelMode",
     "SDType",
     "LogLevel",
     "PreviewMode",
@@ -127,12 +136,19 @@ __all__ = [
     "image_to_image",
     # Model utilities
     "convert_model",
+    "convert_model_with_components",
     "canny_preprocess",
+    # Importance matrix (imatrix) collection
+    "load_imatrix",
+    "save_imatrix",
+    "enable_imatrix_collection",
+    "disable_imatrix_collection",
     # Backend loading
     "ggml_backend_load_all",
     # Utility functions
     "get_num_cores",
     "get_system_info",
+    "list_devices",
     "type_name",
     "sample_method_name",
     "scheduler_name",

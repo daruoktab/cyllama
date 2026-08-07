@@ -17,6 +17,187 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+## [0.4.0]
+
+Two upstream resyncs (llama.cpp b9979 -> b10261, stable-diffusion.cpp master-775 -> master-812) plus the binding-coverage sweep they prompted. Minor rather than patch: `LlamaSampler.add_penalties()` takes a new leading argument, three `LlamaModelParams` booleans are gone, and two `SDImageGenParams` booleans are gone -- see Removed and Fixed.
+
+### Fixed
+
+- **`LlamaSampler.add_penalties()` gained a leading `n_vocab` argument** -- llama.cpp re-added `int32_t n_vocab` as the first parameter of `llama_sampler_init_penalties()`, where it sizes the scatter tensor on the backend (GPU) sampling path; the CPU path ignores it. This was the only hard compile break in the resync. `add_penalties(n_vocab, penalty_last_n, penalty_repeat, penalty_freq, penalty_present)` now matches the convention already used by `add_mirostat()` and `add_logit_bias()`. **Breaking** for direct callers of the low-level sampler; `GenerationConfig`-driven code is unaffected. The three in-tree call sites (`api.py`, `agents/constrained.py`, `llama/chat.py`) already had a vocab in scope.
+
+- **`LlamaContext.get_logits()` and `.get_logits_ith()` raised `AttributeError` on every call** -- both read `self.model.n_vocab`, but `n_vocab` lives on `LlamaVocab`, not `LlamaModel`. Cython compiles the expression to a runtime `getattr`, so it built cleanly and failed only when called. Nothing in the test suite exercised it: the one assertion that would have caught it was commented out at `tests/test_model.py:83`, and the sole in-tree caller (`rag/advanced.py`) was itself unreachable (see below). Both now resolve the vocabulary through `llama_model_get_vocab()` at the C level. Regression tests in `tests/test_new_bindings.py`.
+
+- **`rag.advanced.Reranker` never ran** -- `score()` raised `ImportError` before reaching any native code: it imported `LlamaModel` and friends from `cyllama.llama`, which only lazily exports CLI/server names, and further referenced `common_batch_add` and `LlamaModel.tokenize`, neither of which exists. All eight `TestReranker` cases passed a fake `"model.gguf"` path and stopped short of the native path. Beyond the broken names the approach was wrong: it set neither `embeddings=True` nor `pooling_type=RANK`, then read `get_logits()[0]` -- an LM logit, not a relevance score. Rewritten to build the query/document token sequence the way llama.cpp's server does (`format_prompt_rerank` in `tools/server/server-common.cpp`: optional BOS, query, EOS-or-SEP, SEP, document, EOS, plus the model's `rerank` chat template when it ships one), run under RANK pooling, and read the score from `get_embeddings_seq()`. The KV cache is cleared between pairs so scores don't drift with document order. Covered end-to-end against `bge-reranker-base-q8_0.gguf` in `tests/test_rag_advanced.py`.
+
+- **`memory.dump_metadata_json()` discarded the metadata it loaded the model to read** -- it constructed a full `LlamaModel`, then returned hardcoded defaults (`llama` / 32 layers / 4096 embd / 32:32 attention) for every field except vocab size, so `estimate_gpu_layers()` was effectively a function of vocab size alone. For Llama-3.2-1B every number was wrong (16 layers, 2048 embd, 32:8 GQA); for Gemma-4 even the architecture was (`gemma4`, 42 layers). Now reads the real values from the loaded model, and closes it rather than leaking it. Keys are still returned under the stable `llama.*` prefix regardless of the model's own gguf prefix.
+
+- **KV cache estimate ignored grouped-query attention** -- the per-layer formula used `n_embd`, but the cache is sized by `head_dim * n_head_kv`. On a 32:8 GQA model that overestimated by 4x. Now computed from `n_head_kv`, with sliding-window attention applied when the file states its SWA pattern. When only the window is known but not the pattern the full context is charged: upstream defaults the pattern per architecture, and assuming one we cannot verify would under-estimate the cache and risk OOM.
+
+### Added
+
+- **`LlamaModelParams.load_mode` / `.load_mode_name` and the `LLAMA_LOAD_MODE_*` constants** -- bind the `load_mode` field that llama.cpp b10107 added to `llama_model_params`, replacing the three removed booleans. `cyllama.llama.llama_cpp` exports `LLAMA_LOAD_MODE_NONE` (0), `LLAMA_LOAD_MODE_MMAP` (1, the default), `LLAMA_LOAD_MODE_MLOCK` (2), `LLAMA_LOAD_MODE_MMAP_MLOCK` (3) and `LLAMA_LOAD_MODE_DIRECT_IO` (4); `load_mode_name` returns the upstream string for the current value (`llama_load_mode_name()`). Declared in `src/cyllama/llama/llama.pxd` (with `llama_load_mode_from_str()`), implemented in `llama_cpp.pyx`, covered by `tests/test_params.py`.
+
+- **`LLAMA_POOLING_TYPE_*` constants** -- `UNSPECIFIED` (-1), `NONE`, `MEAN`, `CLS`, `LAST` and `RANK` (4) are now module-level constants rather than bare integers callers had to hardcode. `RANK` in particular is not discoverable otherwise, and it is what attaches a reranker's classification head to the graph.
+
+- **`SDImageGenParams.ref_image_args`** -- binds the `sd_img_gen_params_t.ref_image_args` string that stable-diffusion.cpp master-795 introduced in place of the two reference-image booleans. Comma-separated `key=value` list understood by the backend: `preset`, `pass_to_vlm`, `pass_to_dit`, `ref_index_mode` (`fixed`/`increase`/`decrease`), `force_ref_timestep_zero`, `resize_before_vae`, `vae_input_max_pixels`, `vlm_resize_mode`, `vlm_max_size`, `vlm_min_size`, `vlm_size`.
+
+- **`SDContextParams.ip_adapter_path` / `.motion_module_path` and `SDImageGenParams.set_ip_adapter_image()` / `.ip_adapter_strength`** -- bind the IP-Adapter and motion-module fields added to `sd_ctx_params_t` and `sd_img_gen_params_t` in stable-diffusion.cpp master-795. The two context paths are validated like the other optional sub-model paths when a context is created.
+
+- **`VaeFormat.WAN`** -- new `sd_vae_format_t` enumerator (value 3, shifting `SD_VAE_FORMAT_COUNT` to 4).
+
+- **`--sd-vendored-ggml` build flag** -- restores the opt-out now that sharing llama.cpp's ggml is the default (see Changed); sets `SD_USE_VENDORED_GGML=1`. `--sd-shared-ggml` is kept as an explicit no-op for scripts that already pass it.
+
+- **`scripts/patches/proposed/llama.cpp-metal-tensor-msl4.patch`, documented but deliberately not applied** -- ggml's Metal backend never sets `MTLCompileOptions.languageVersion`, so runtime shader compilation inherits a default derived from the SDK the *host process* was linked against rather than the running OS. Under uv's CPython 3.13 (linked against the macOS 15.5 SDK) that default falls below MSL 4.0, the `<metal_tensor>` / MetalPerformancePrimitives headers are unavailable, and ggml's tensor-API probe fails with `use of undeclared identifier 'mpp'` -- logging `the tensor API is not supported in this environment - disabling` even on M5-class hardware running macOS 26. The patch requests MSL 4.0 explicitly when the device reports the Metal 4 GPU family, which fixes the probe and is numerically inert on its own (forcing MSL 4.0 with the tensor path off yields bit-identical output). It is not applied because it *enables* ggml's tensor matmul kernels, and those render a blank white image in stable-diffusion.cpp -- reproduced on both ggml 0.15.3 and 0.17.0, at 512x512 and 512x1024, with and without `--diffusion-fa` / `--vae-on-cpu`, at cfg 1.0 and 7.0, while llama.cpp text generation stays bit-identical with the path on or off. Since SD shares llama.cpp's ggml both extensions link the same `libggml-metal.a` and ggml resolves `has_tensor` once per process, so the tensor path is all-or-nothing for any process loading both; correct-and-slower wins. The forgone speedup is ~1.8x on Metal (13.99 -> 7.78 s/it, M5 Pro / macOS 26.5, Z-Image Turbo at 512x1024). The failure is silent -- no error, an ~8K PNG where a real 512x512 render is ~300K -- and `GGML_METAL_TENSOR_DISABLE=1` toggles the path at runtime, so re-testing after a ggml bump needs no rebuild. Full analysis in `scripts/patches/README.md`.
+
+- **`LlamaContext.get_embeddings_seq()`** -- previously commented out in `llama_cpp.pyx`. Returns the pooled per-sequence output: `n_cls_out` floats under `LLAMA_POOLING_TYPE_RANK` (a reranker's relevance score, otherwise unreachable), `n_embd` floats under any other pooling mode, and `None` when the context has no pooled output. Branches on the *effective* pooling type (`llama_pooling_type(ctx)`) rather than the requested one, since RANK models typically leave the request `UNSPECIFIED` and rely on their own default.
+
+- **`LlamaModel.n_cls_out` / `.cls_label()` / `.n_swa` / `.n_embd_out`** -- classifier-head shape and labels (for reranking and classification models), the sliding-window span (0 for full-attention models), and the output embedding width.
+
+- **`LlamaVocab.get_suppress_tokens()`** -- reads the `tokenizer.ggml.suppress_tokens` gguf key that llama.cpp added, listing tokens the model author marked never-emit. Returns `[]` for models that declare none. Feed to `add_logit_bias()` with a large negative bias to honour them.
+
+- **`LlamaSampler.add_dry()`, `.add_top_n_sigma()`, `.add_adaptive_p()`, `.add_grammar_lazy_patterns()`** -- four samplers that were declared in the `.pxd` but had no Python wrapper. DRY penalises continuations of phrases already in the context (as opposed to `add_penalties()`, which works per-token); top-n-sigma thresholds on the logit distribution's own spread; adaptive-p steers the truncation threshold toward a target probability. `add_grammar_lazy_patterns()` binds `llama_sampler_init_grammar_lazy_patterns()`, where the grammar stays dormant until a trigger pattern or token appears -- the mechanism behind constrained tool calling, and something `add_grammar()` cannot express since it constrains from the first token.
+
+- **`GenerationConfig.dry_multiplier` / `.dry_base` / `.dry_allowed_length` / `.dry_penalty_last_n` / `.dry_sequence_breakers` / `.top_n_sigma`** -- expose DRY and top-n-sigma through the high-level API, defaulting to upstream's values from `common.h` (both disabled). DRY is added ahead of the truncation samplers; top-n-sigma replaces top-k/top-p/min-p when enabled, matching upstream.
+
+- **`LlamaSampler.__len__()` / `.chain_get()` / `.chain_remove()`** -- inspect and edit an assembled sampler chain. `chain_get()` returns a borrowed, non-owning view; `chain_remove()` detaches a link and transfers ownership to the caller.
+
+- **`LlamaContext.memory_can_shift()` and `.memory_seq_div()`** -- complete the context-shifting surface. `memory_can_shift()` should gate any shift: recurrent and some hybrid models have no shiftable cache and shifting them silently corrupts state.
+
+- **`llama_print_system_info()`, `llama_split_path()`, `llama_split_prefix()`** -- backend/CPU feature summary, and the split-GGUF filename helpers. Note that loading a split model needs neither helper: passing the first shard to `LlamaModel` makes llama.cpp discover the rest from the `split.count` metadata key. `split_no` is 0-based (llama.h's example comment disagrees with its own implementation, which writes `split_no + 1`).
+
+- **`WhisperVadContext`, `WhisperVadSegments`, `WhisperVadContextParams`** -- the standalone voice-activity-detection API (12 previously unwrapped functions). Until now only the `WhisperFullParams.vad` flag was exposed, which gates transcription but yields no segments. This runs a Silero VAD model directly: `detect_speech()` / `probs()` for per-frame probabilities, `segments_from_probs()` / `segments_from_samples()` for spans, and `reset_state()` plus `detect_speech(..., reset_state=False)` for streaming across chunks of one utterance. Segments are in 10 ms units, matching `full_get_segment_t0` / `_t1`. Both classes support `close()` / `with`.
+
+- **`WhisperContext.full_n_vad_segments()` / `.full_get_vad_segment_t0()` / `_t1()`** -- read back the speech spans the internal VAD actually used during a `full()` run with `params.vad = True`. New upstream in this bump; verified to match the standalone VAD exactly on the same audio.
+
+- **`WhisperContext.full_parallel()`** -- transcribe with the audio split across N worker contexts. Trades some accuracy for throughput: each chunk loses the previous chunk's context, so boundary text and timestamps degrade.
+
+- **`WhisperContext.lang_auto_detect()` and `.pcm_to_mel()`** -- language identification from the mel spectrogram without a full decode. `pcm_to_mel()` was commented out and is required to drive the stage-by-stage path. `lang_auto_detect()` refuses English-only checkpoints: upstream has no such guard and returns an arbitrary id with near-uniform probabilities, which reads as a real answer.
+
+- **`MtmdContext.open_video()`, `MtmdVideo`** -- video input via the mtmd ffmpeg helper (7 previously unwrapped functions). Iterating yields `("image", MtmdBitmap)` and `("text", str)` pairs, the latter being periodic timestamp markers. Requires ffmpeg/ffprobe on the system; video exists only at the helper level, so frames reach the projector as ordinary images.
+
+- **`MtmdContext.batch()`, `MtmdBatch`** -- batch several media chunks through one projector pass instead of one pass per image. Matters for multi-image prompts and for video, where every sampled frame is its own chunk. Chunks are borrowed, so the owning `MtmdInputChunks` must outlive the batch.
+
+- **`get_mmproj_caps()` and `MtmdContext.model_can_chat()`** -- report an mmproj's input modalities without initializing a context, and whether a model/mmproj pairing has a usable chat path.
+
+- **`sd.Adetailer`** -- after-detailer: a detection model locates regions (typically faces) and each is re-generated through an existing `SDContext` at full resolution, the standard fix for mushy faces on small subjects. Takes the same busy-lock as `SDContext.generate()`, since it drives the diffusion context with the GIL released. The three C functions were declared in the `.pxd` but unwrapped.
+
+- **`sd.version()` and `sd.commit()`** -- the vendored stable-diffusion.cpp revision, otherwise invisible from Python and awkward to report in bug reports.
+
+- **`SampleMethod.LMS`** -- new `sample_method_t` enumerator added upstream, which also shifts `SAMPLE_METHOD_COUNT`.
+
+### Changed
+
+- **llama.cpp updated to b10107 (from b9979)** -- `llama_model_params` dropped `use_mmap`, `use_direct_io` and `use_mlock` in favour of the single `load_mode` enum (see Added and Removed). New enumerators were mirrored to keep the bindings in sync with the upstream headers: `GGML_OP_DSV4_HC_COMB` / `_PRE` / `_POST` in `src/cyllama/llama/ggml.pxd` (bumping `GGML_OP_COUNT` to 101), along with `ggml_cpu_has_sme2()` and `gguf_get_tensor_ne()`.
+
+- **stable-diffusion.cpp updated to master-795-87a0177 (from master-775-b5d8120)** -- `sd_img_gen_params_t` replaced `auto_resize_ref_image` / `increase_ref_index` with the `ref_image_args` string and gained IP-Adapter fields; `sd_ctx_params_t` gained `ip_adapter_path` / `motion_module_path` (see Added). The after-detailer API (`new_adetailer_ctx()`, `free_adetailer_ctx()`, `adetail_image()`) was declared in `stable_diffusion.pxd` by this update and is wrapped as `sd.Adetailer` (see Added).
+
+- **stable-diffusion.cpp now shares llama.cpp's ggml by default** -- `SD_USE_VENDORED_GGML` flips from `ON` to `OFF` in `CMakeLists.txt`, and `StableDiffusionCppBuilder.uses_shared_ggml()` now defaults to sharing (`os.environ.get("SD_USE_VENDORED_GGML", "0") == "0"`), mirroring CMake's resolution order: unset or `0` shares, any other value opts back into SD's vendored copy. The CMake option alone was not sufficient -- `_sync_ggml_abi()`, the `GGML_MAX_NAME=128` propagation into the llama.cpp build, the pre-built-release skip and `_write_build_info()` all keyed off a raw `os.environ.get("SD_USE_VENDORED_GGML") == "0"` check, so with only the option flipped SD would have linked llama.cpp's ggml while still compiling against its own headers (enum-ordinal drift plus a `ggml_tensor` layout mismatch, the failure analysed in `docs/dev/ggml_max_name.md`). All those call sites now go through the helper and no raw env reads remain. This completes the "flip the CMake default" follow-up recorded in `docs/dev/ggml-unification.md`. Verified on macOS 26.5 / M5 Pro: all three extensions report ggml 0.17.0 (SD previously reported 0.15.3), `-DGGML_MAX_NAME=128` reaches the llama.cpp build, and a fixed-seed Z-Image Turbo render is bit-identical to the one produced by SD's vendored 0.15.3 -- the unification is numerically neutral. `docs/build_backends.md`, `docs/stable_diffusion.md`, `docs/installation.md`, `docs/dev/build-options.md` and `docs/dev/static-vs-dynamic.md` are updated to state the new default.
+
+- **Source-patch machinery generalized to every ggml-backed builder** -- `_apply_source_patches()` and `_apply_patch()` moved from `LlamaCppBuilder` up to `GgmlBuilder`, and `WhisperCppBuilder.build()` / `StableDiffusionCppBuilder.build()` now call them (the SD call runs after `_sync_ggml_abi()`, so patches land on whichever ggml copy is actually compiled). Two globs are applied per tree: `ggml-*.patch` for fixes to the ggml copy that every project vendors, and `<project>-*.patch` for one upstream only. Both keep the existing idempotent, self-disabling `git apply --check` / `--reverse --check` behaviour. A `scripts/patches/proposed/` subdirectory is inert -- the globs are non-recursive -- and holds patches that are correct in isolation but not safe to ship.
+
+
+- **llama.cpp updated to b10261, stable-diffusion.cpp to master-812-ea7f0c8** -- beyond the penalties signature, `llama_load_mode` gained `LLAMA_LOAD_MODE_MMAP_MLOCK` at ordinal 3, shifting `DIRECT_IO` to 4 and redefining `MLOCK` as mlock *without* mmap. The `llama` CLI's `--mlock` continues to map to `LLAMA_LOAD_MODE_MLOCK`, matching upstream `arg.cpp`.
+
+- **`Reranker` now loads its context with `embeddings=True` and `pooling_type=RANK`** -- required for the classification head to be built at all. Callers who relied on the previous (non-functional) behaviour will now get real scores; these are raw classifier logits, unbounded and only comparable within a single model.
+
+### Removed
+
+- **`LlamaModelParams.use_mmap` / `.use_mlock` / `.use_direct_io`** -- llama.cpp b10107 removed the three `llama_model_params` booleans, which were mutually exclusive in practice, in favour of the `load_mode` enum (see Added). Three booleans cannot faithfully represent four exclusive states, so the properties were dropped rather than shimmed. Set `params.load_mode = LLAMA_LOAD_MODE_NONE / _MMAP / _MLOCK / _DIRECT_IO` instead. The `llama` CLI is unchanged: its `--no-mmap` / `--mlock` flags now map to `load_mode` internally, with `--mlock` winning over `--no-mmap`. (b10261 later split `MLOCK` from the combined `MMAP_MLOCK` mode, so mlock no longer implies mmap -- see Changed.)
+
+- **`SDImageGenParams.auto_resize_ref_image` / `.increase_ref_index`** -- stable-diffusion.cpp master-795 removed the two `sd_img_gen_params_t` booleans, folding reference-image behaviour into the `ref_image_args` key=value string (see Added). Set `params.ref_image_args = "resize_before_vae=0"` and `"ref_index_mode=increase"` instead -- the same mapping the upstream CLI performs.
+
+### Notes
+
+- **`free_sd_images()` is deliberately left unwrapped** -- stable-diffusion.cpp documents it as the C-API deallocator for result arrays, but it frees the array *and* every image's pixel buffer. cyllama transfers per-image ownership to `SDImage` objects, so calling it would double-free. The existing per-pointer `free()` is correct here: the extension links stable-diffusion.cpp statically, so there is no cross-CRT boundary of the kind the upstream note warns about.
+
+- **The remaining unwrapped surface is intentional** -- backend (GPU-resident) sampling (`llama_set_sampler` plus the `llama_get_sampled_*_ith` accessors) changes the decode-loop contract rather than adding a call; `llama_opt_*` is the training API; the mtmd audio-generation API and `whisper_*_with_state` variants have no consumer yet; `mtmd_get_memory_usage` is C++-only and upstream marks it as unstable and slated for removal.
+
+## [0.3.5]
+
+### Fixed
+
+- **Segfault in `MtmdContext.tokenize()` after the b9979 update** -- llama.cpp b9979 added a `size_t text_len` field to the `mtmd_input_text` struct and the tokenizer now consumes it (`input_text.assign(text->text, text->text_len)` in `mtmd.cpp`). The Cython binding declared the struct without `text_len` and never set it, so the stack-allocated struct carried an uninitialized length, causing an out-of-bounds read and a segfault (reproduced by `tests/test_mtmd.py::test_tokenize_image`). Fixed by adding `size_t text_len` to the `mtmd_input_text` declaration in `src/cyllama/llama/mtmd.pxd` and setting `input_text.text_len` to the encoded byte length in `src/cyllama/llama/mtmd.pxi`.
+
+### Added
+
+- **`SDContextParams.model_args` and `.auto_fit`** -- bind the two new `sd_ctx_params_t` fields (stable-diffusion.cpp master-775). `model_args` is an `Optional[str]` comma-separated key=value list (e.g. `"chroma_use_dit_mask=0,chroma_t5_mask_pad=10,qwen_image_zero_cond_t=1"`) consumed by the diffusion-model loader; `auto_fit` is a bool. Declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`SDImageGenParams.circular_x` / `.circular_y`** -- bind the `circular_x` / `circular_y` fields that upstream moved from the context params onto the per-generation image params (tileable generation). Bool properties; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`. (The identically-named fields were also added to `sd_vid_gen_params_t` and are mirrored in the `.pxd`.)
+
+- **`SampleMethod.DPMPP2M_SDE` / `.DPMPP2M_SDE_BT`** -- new members mirroring the `DPMPP2M_SDE_SAMPLE_METHOD` / `DPMPP2M_SDE_BT_SAMPLE_METHOD` enum values added to stable-diffusion.cpp master-775. Added to the C enum declaration in `stable_diffusion.pxd` and the Python `SampleMethod` `IntEnum`.
+
+- **`SDContext.load_control_net()` / `.unload_control_net()` / `.has_control_net`** -- bind the ControlNet hot-swap APIs added in stable-diffusion.cpp master-775 (`sd_ctx_load_control_net` / `sd_ctx_unload_control_net` / `sd_ctx_has_control_net`). `load_control_net(path)` swaps a ControlNet into an existing context (raises `FileNotFoundError` for a missing path, returns `True` on success); `unload_control_net()` removes it; `has_control_net` reports whether one is loaded. These are not safe to call while a generation is in flight. Declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+### Changed
+
+- **llama.cpp updated to b9979 (from b9871)** -- the header changes were additive. New enumerators were mirrored to keep the Cython bindings in sync with the upstream headers: `GGML_TYPE_Q2_0` (42, bumping `GGML_TYPE_COUNT` to 43) and `GGML_OP_LIGHTNING_INDEXER` in `src/cyllama/llama/ggml.pxd`, and `LLAMA_FTYPE_MOSTLY_Q2_0` (41) in `src/cyllama/llama/llama.pxd`. The `LlamaModelQuantizeParams` default-sentinel assertions in `tests/test_params.py` were updated to the new `GGML_TYPE_COUNT` value (43). The `mtmd_input_text` `text_len` field is also part of this bump (see Fixed).
+
+- **stable-diffusion.cpp updated to master-775-b5d8120 (from master-748-68f3d6d)** -- the `convert_with_components()` export gained a trailing `int n_threads` parameter; `convert_model_with_components()` now takes an `n_threads` kwarg (default `-1` = auto, resolved via `sd_get_num_physical_cores()`) and passes it through. New ControlNet hot-swap APIs and `circular_x` / `circular_y` (moved to the gen params) are now bound (see Added).
+
+### Removed
+
+- **`SDContextParams.chroma_use_dit_mask` / `.chroma_use_t5_mask` / `.chroma_t5_mask_pad` / `.qwen_image_zero_cond_t` and `.circular_x` / `.circular_y`** -- stable-diffusion.cpp master-775 removed the dedicated `sd_ctx_params_t` struct fields, folding the chroma/qwen tuning knobs into the new `model_args` key=value string and moving circular padding to the gen params (see Added). Set these through `SDContextParams.model_args` (e.g. `"chroma_use_dit_mask=0"`) and `SDImageGenParams.circular_x/.circular_y` instead. The `sd` CLI is unchanged: its `--chroma-disable-dit-mask` / `--chroma-enable-t5-mask` / `--chroma-t5-mask-pad` flags are now assembled into `model_args` internally.
+
+## [0.3.4]
+
+### Added
+
+- **`LlamaModel.ftype` / `.ftype_name` and module-level `ftype_name()`** -- bind the two accessors added in llama.cpp b9871: `llama_model_ftype()` (the model's file-type/quantization as a `llama_ftype` enum) and `llama_ftype_name()` (maps a `llama_ftype` value to a string, e.g. `"Q8_0"`). `LlamaModel.ftype` returns the raw enum int, `.ftype_name` the human string; `cyllama.llama.llama_cpp.ftype_name(ftype)` converts any ftype value (such as `LlamaModelQuantizeParams.ftype`). Declared in `src/cyllama/llama/llama.pxd`, implemented in `llama_cpp.pyx`, covered by `tests/test_model.py`.
+
+- **`SDContextParams.split_mode`** -- exposes the new `sd_ctx_params_t.split_mode` field (stable-diffusion.cpp master-748), a `const char*` controlling weight distribution across multiple devices: `"layer"` (default) or `"row"`, or per-module assignments such as `"diffusion=row"`. `Optional[str]` property; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`SDImageGenParams.qwen_image_layers`** -- binds the new `sd_img_gen_params_t.qwen_image_layers` int field (stable-diffusion.cpp master-748), the number of Qwen-Image transformer layers to run (default supplied by `sd_img_gen_params_init()`). Standard int property; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`convert_model_with_components()`** -- wraps the new `convert_with_components()` export (stable-diffusion.cpp master-748), converting a model to a target quantization from separate component files (combined checkpoint, CLIP-L / CLIP-G / T5-XXL text encoders, diffusion model, VAE) instead of a single input path. Requires at least one component path (else `ValueError`) and validates that each provided path exists (else `FileNotFoundError`). Exported from `cyllama.sd`; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **Importance-matrix (imatrix) collection: `load_imatrix()` / `save_imatrix()` / `enable_imatrix_collection()` / `disable_imatrix_collection()`** -- bind the four new imatrix exports (stable-diffusion.cpp master-748) that gather per-tensor importance statistics for higher-quality quantization. `load_imatrix()` raises `FileNotFoundError` for a missing path. The C symbols are aliased in the pxd (`c_load_imatrix`, etc.) so the identically-named Python wrappers don't shadow and recurse into them. Exported from `cyllama.sd`; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`list_devices()`** -- wraps the new `sd_list_devices()` export (stable-diffusion.cpp master-748), returning a `list[(name, description)]` of available ggml backend devices (e.g. `("MTL0", "Apple M1")`, `("BLAS", "Accelerate")`, `("CPU", "Apple M1")`). The `name` values are those accepted by the `backend` / `params_backend` context params and the `split_mode` per-module assignment specs. Exported from `cyllama.sd`; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`Scheduler.FLUX2` / `.FLUX` / `.BETA` and `Prediction.MINIT2I_FLOW`** -- new members mirroring the `FLUX2_SCHEDULER` / `FLUX_SCHEDULER` / `BETA_SCHEDULER` and `MINIT2I_FLOW_PRED` enum values added to stable-diffusion.cpp master-748. Added to the C enum declarations in `stable_diffusion.pxd` and the Python `Scheduler` / `Prediction` `IntEnum`s, covered by `tests/test_sd.py`.
+
+### Changed
+
+- **llama.cpp updated to b9871 (from b9837); stable-diffusion.cpp updated to master-748-68f3d6d (from master-731-9f855c9); whisper.cpp updated to v1.9.1 (from v1.8.6)** -- the llama.cpp header change was additive (`llama_model_ftype()` / `llama_ftype_name()`, now bound -- see Added). stable-diffusion.cpp changed the `generate_image()` and `upscale()` signatures and reworked the `prediction_t` enum (see Fixed / Removed) and added new fields and functions (see Added). whisper.cpp's public `whisper.h` was unchanged; the update also newly builds a `libparakeet.a` (Parakeet ASR) which cyllama deliberately does not link -- it is redundant to the existing whisper bindings.
+
+- **`python -m cyllama.sd --prediction` choices updated** -- the `--prediction` CLI choice list drops `flux2_flow` and adds `sefi_flow` / `minit2i_flow`, matching the reworked `prediction_t` enum. Changed in `src/cyllama/sd/__main__.py`.
+
+### Removed
+
+- **`Prediction.FLUX2_FLOW`** -- removed because upstream deleted the `FLUX2_FLOW_PRED` enumerator from `prediction_t` (stable-diffusion.cpp master-748). The `flux2_flow` value is likewise gone from the `python -m cyllama.sd --prediction` choices (see Changed) and the `Prediction` table in `docs/stable_diffusion.md` / `docs/api_reference.md`.
+
+### Fixed
+
+- **Build broke against updated stable-diffusion.cpp (master-748)** -- the vendored bindings fell out of sync with three upstream API changes and the Cython extension failed to compile: `generate_image()` and `upscale()` changed from returning `sd_image_t*` / `sd_image_t` to returning `bool` with out-parameters (`sd_image_t** images_out, int* num_images_out`), and the `prediction_t` enum removed `FLUX2_FLOW_PRED` and added `MINIT2I_FLOW_PRED`. The `.pxd` signatures and both call sites were updated; `generate_image()` / `upscale()` now take the image count from the returned out-parameter (authoritative) rather than assuming `batch_count`, and free the library-allocated array accordingly. Fixed in `src/cyllama/sd/stable_diffusion.pxd` and `stable_diffusion.pyx`; the `Prediction` / CLI / doc fallout is covered under Added / Changed / Removed.
+
+- **Extension failed to import with `undefined symbol: X509_NAME_free`** -- the compiled `cyllama.llama.llama_cpp` extension linked llama.cpp's vendored cpp-httplib (built with `LLAMA_OPENSSL=True`) via `-Wl,--whole-archive`, force-including its OpenSSL `SSLClient` code. When a prior change (`26be940`) removed OpenSSL from the link, the resulting `.so` was left with unresolved `X509_NAME_free` / `SSL_CTX_new` symbols and every `import cyllama` failed at load with an `ImportError` (all 56 test modules errored during collection). cpp-httplib is not actually used by cyllama -- the embedded server is Mongoose-based, and neither `libllama.a` nor `libmtmd.a` reference httplib -- so it is no longer linked at all, which also drops the OpenSSL runtime dependency entirely (restoring wheel portability). `scripts/manage.py` correspondingly sets `LLAMA_OPENSSL=False` and no longer copies `libcpp-httplib.a`. Changed in `CMakeLists.txt` and `scripts/manage.py`.
+
+## [0.3.3]
+
+### Added
+
+- **PuLID identity customization (`SDImageGenParams.pulid_id_embedding_path` / `.pulid_id_weight`, `SDContextParams.pulid_weights_path`)** -- binds the new `sd_pulid_params_t` struct and the `sd_img_gen_params_t.pulid_params` / `sd_ctx_params_t.pulid_weights_path` fields added to stable-diffusion.cpp master-731-9f855c9. PuLID is an identity-conditioning method (like Photo Maker): the PuLID weights are loaded once via `SDContextParams.pulid_weights_path`, and each generation points at a precomputed identity embedding (`pulid_id_embedding_path`, `Optional[str]`; `None` clears it) with a configurable `pulid_id_weight` (`float`). Mirrors the existing Photo Maker plumbing and, like it, is exposed through `SDImageGenParams` + `SDContext.generate_with_params()` rather than the `generate()` convenience kwargs. `pulid_weights_path` is included in `SDContext.__init__`'s path validation so a bad path raises a typed error. Declared in `src/cyllama/sd/stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`, documented in `docs/stable_diffusion.md` / `docs/api_reference.md`.
+
+- **`SDContext.cancel()` and `CancelMode` enum** -- bind the new `sd_cancel_generation()` export and `sd_cancel_mode_t` enum (stable-diffusion.cpp master-731). `cancel(mode=CancelMode.ALL)` requests cancellation of an in-flight `generate()` / `generate_video()`; `CancelMode.ALL` stops as soon as possible, `CancelMode.NEW_LATENTS` finishes the current sample then skips remaining batch latents, and `CancelMode.RESET` clears a pending request. Intended to be called from a different thread than the one generating (which holds the busy lock and has released the GIL during native sampling), so `cancel()` deliberately does not take the busy lock. `CancelMode` is exported from `cyllama.sd`. Declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`SDContextParams.eager_load` and `.rpc_servers`** -- expose the two new `sd_ctx_params_t` fields added in stable-diffusion.cpp master-731. `eager_load` (bool) loads all params into the params backend at model-load time instead of lazily on first use; `rpc_servers` (`Optional[str]`) is a comma-separated list of RPC backend endpoints. Standard property getter/setters; declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`Scheduler.LOGIT_NORMAL` and `Prediction.SEFI_FLOW`** -- new members mirroring the `LOGIT_NORMAL_SCHEDULER` and `SEFI_FLOW_PRED` enum values added to stable-diffusion.cpp master-731. Added to the C enum declarations in `stable_diffusion.pxd` and the Python `Scheduler` / `Prediction` `IntEnum`s, covered by `tests/test_sd.py`.
+
+- **`LlamaModel.n_layer_nextn`** -- binds the new `llama_model_n_layer_nextn()` accessor added in llama.cpp b9837, returning the number of nextn (multi-token-prediction) layers in the model (0 for models without MTP layers, e.g. Llama-3.2-1B). Declared in `src/cyllama/llama/llama.pxd`, implemented in `llama_cpp.pyx`, covered by `tests/test_model.py`.
+
+### Changed
+
+- **llama.cpp updated to b9837 (from b9628); stable-diffusion.cpp updated to master-731-9f855c9 (from master-694-276025e)** -- the llama.cpp header change was additive (`llama_model_n_layer_nextn()`, now bound -- see Added) and did not break the build. The stable-diffusion.cpp update reworked `sd_ctx_params_t`: it removed several per-component memory-placement fields (see Removed), changed `max_vram` from `float` to `const char*`, and added new fields (see Added). whisper.cpp is unchanged (v1.8.6).
+
+- **`SDContextParams.max_vram` is now a string** -- upstream changed the `sd_ctx_params_t.max_vram` field from `float` to `const char*`: it is now a GiB budget *or* a backend-assignment spec for graph-cut segmented param offload (`"0"` = disabled, `"-1"` = auto). The property returns `Optional[str]` (`None` when unset) and the setter accepts a string; for backwards compatibility it also coerces numeric values to their string form (e.g. `-1` -> `"-1"`). This single mechanism replaces the removed per-component CPU-offload flags. Declared in `stable_diffusion.pxd`, implemented in `stable_diffusion.pyx`, covered by `tests/test_sd.py`.
+
+- **`python -m cyllama.sd` low-VRAM CLI flags remapped onto `--max-vram`** -- the SD CLI gains `--max-vram` (string) and `--eager-load`. The legacy `--offload-to-cpu` / `--clip-on-cpu` / `--vae-on-cpu` / `--control-net-cpu` flags are retained for compatibility but, since upstream removed per-component CPU placement, now map to `--max-vram -1` (auto offload) when an explicit `--max-vram` is not given. The `upscale` subcommand's `--offload-to-cpu` flag is removed (the underlying `new_upscaler_ctx()` dropped its `offload_params_to_cpu` argument).
+
+### Removed
+
+- **`SDContextParams` per-component memory-placement properties** -- `vae_decode_only`, `free_params_immediately`, `offload_params_to_cpu`, `keep_clip_on_cpu`, `keep_vae_on_cpu`, and `keep_control_net_on_cpu` were removed because the corresponding `sd_ctx_params_t` fields were removed upstream (stable-diffusion.cpp master-731), consolidated into the `max_vram` string spec (see Changed). The `offload_to_cpu` / `keep_clip_on_cpu` / `keep_vae_on_cpu` keyword arguments were correspondingly dropped from the `text_to_image()` / `text_to_images()` convenience functions, the `vae_decode_only` argument was dropped from `SDContextParams.__init__()` and `image_to_image()` (the encoder is now always available for img2img), and `offload_to_cpu` was dropped from `Upscaler.__init__()`.
+
 ## [0.3.2]
 
 ### Added

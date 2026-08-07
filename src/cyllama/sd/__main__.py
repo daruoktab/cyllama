@@ -208,16 +208,19 @@ def create_context_params(args: argparse.Namespace) -> "SDContextParams":
     if hasattr(args, "tensor_type_rules") and args.tensor_type_rules:
         params.tensor_type_rules = args.tensor_type_rules
 
-    # Memory/performance options
-    if hasattr(args, "offload_to_cpu") and args.offload_to_cpu:
-        params.offload_params_to_cpu = True
-        params.free_params_immediately = True
-    if hasattr(args, "clip_on_cpu") and args.clip_on_cpu:
-        params.keep_clip_on_cpu = True
-    if hasattr(args, "vae_on_cpu") and args.vae_on_cpu:
-        params.keep_vae_on_cpu = True
-    if hasattr(args, "control_net_cpu") and args.control_net_cpu:
-        params.keep_control_net_on_cpu = True
+    # Memory/performance options.
+    #
+    # Upstream replaced the old per-component CPU-placement flags
+    # (offload_params_to_cpu / keep_clip_on_cpu / keep_vae_on_cpu /
+    # keep_control_net_on_cpu) with a single graph-cut segmented param offload
+    # controlled by `max_vram` ("0" = disabled, "-1" = auto). An explicit
+    # --max-vram wins; otherwise any legacy low-VRAM flag maps to auto offload.
+    if hasattr(args, "max_vram") and args.max_vram is not None:
+        params.max_vram = args.max_vram
+    elif any(getattr(args, name, False) for name in ("offload_to_cpu", "clip_on_cpu", "vae_on_cpu", "control_net_cpu")):
+        params.max_vram = "-1"
+    if hasattr(args, "eager_load") and args.eager_load:
+        params.eager_load = True
     if hasattr(args, "diffusion_fa") and args.diffusion_fa:
         params.diffusion_flash_attn = True
     if hasattr(args, "diffusion_conv_direct") and args.diffusion_conv_direct:
@@ -239,7 +242,8 @@ def create_context_params(args: argparse.Namespace) -> "SDContextParams":
             "edm_v": Prediction.EDM_V,
             "flow": Prediction.FLOW,
             "flux_flow": Prediction.FLUX_FLOW,
-            "flux2_flow": Prediction.FLUX2_FLOW,
+            "sefi_flow": Prediction.SEFI_FLOW,
+            "minit2i_flow": Prediction.MINIT2I_FLOW,
         }
         params.prediction = pred_map.get(args.prediction, Prediction.EPS)
     if hasattr(args, "lora_apply_mode") and args.lora_apply_mode:
@@ -250,13 +254,17 @@ def create_context_params(args: argparse.Namespace) -> "SDContextParams":
         }
         params.lora_apply_mode = mode_map.get(args.lora_apply_mode, LoraApplyMode.AUTO)
 
-    # Chroma options
+    # Chroma options -- upstream folded the dedicated struct fields into the
+    # model_args key=value string, so assemble them here.
+    model_args = []
     if hasattr(args, "chroma_disable_dit_mask") and args.chroma_disable_dit_mask:
-        params.chroma_use_dit_mask = False
+        model_args.append("chroma_use_dit_mask=0")
     if hasattr(args, "chroma_enable_t5_mask") and args.chroma_enable_t5_mask:
-        params.chroma_use_t5_mask = True
+        model_args.append("chroma_use_t5_mask=1")
     if hasattr(args, "chroma_t5_mask_pad") and args.chroma_t5_mask_pad:
-        params.chroma_t5_mask_pad = args.chroma_t5_mask_pad
+        model_args.append(f"chroma_t5_mask_pad={args.chroma_t5_mask_pad}")
+    if model_args:
+        params.model_args = ",".join(model_args)
 
     # TAESD options
     if hasattr(args, "taesd_preview_only") and args.taesd_preview_only:
@@ -402,7 +410,6 @@ def cmd_img2img(args: argparse.Namespace) -> int:
     start = time.time()
 
     params = create_context_params(args)
-    params.vae_decode_only = False  # Need encoder for img2img
 
     try:
         ctx = SDContext(params)
@@ -490,7 +497,6 @@ def cmd_inpaint(args: argparse.Namespace) -> int:
     start = time.time()
 
     params = create_context_params(args)
-    params.vae_decode_only = False
 
     try:
         ctx = SDContext(params)
@@ -729,7 +735,7 @@ def cmd_upscale(args: argparse.Namespace) -> int:
 
     print(f"Loading upscaler: {args.model}")
     try:
-        upscaler = Upscaler(args.model, n_threads=args.threads, offload_to_cpu=args.offload_to_cpu)
+        upscaler = Upscaler(args.model, n_threads=args.threads)
     except Exception as e:
         print(f"Error loading upscaler: {e}", file=sys.stderr)
         return 1
@@ -890,7 +896,7 @@ def add_common_sampler_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--prediction",
-        choices=["eps", "v", "edm_v", "sd3_flow", "flux_flow", "flux2_flow"],
+        choices=["eps", "v", "edm_v", "sd3_flow", "flux_flow", "sefi_flow", "minit2i_flow"],
         help="Prediction type override",
     )
 
@@ -917,6 +923,20 @@ def add_common_guidance_args(parser: argparse.ArgumentParser) -> None:
 def add_common_memory_args(parser: argparse.ArgumentParser) -> None:
     """Add memory/performance arguments."""
     parser.add_argument("--threads", "-t", type=int, default=-1, help="Number of threads")
+    parser.add_argument(
+        "--max-vram",
+        dest="max_vram",
+        default=None,
+        help='GiB budget or backend-assignment spec for graph-cut segmented param offload ("0" = disabled, "-1" = auto)',
+    )
+    parser.add_argument(
+        "--eager-load",
+        dest="eager_load",
+        action="store_true",
+        help="Load all params into the params backend at model-load time instead of lazily",
+    )
+    # Legacy low-VRAM flags: upstream consolidated these into --max-vram; kept
+    # for compatibility, each maps to auto offload (--max-vram -1).
     parser.add_argument(
         "--offload-to-cpu", dest="offload_to_cpu", action="store_true", help="Offload weights to CPU (low VRAM)"
     )
@@ -1177,7 +1197,6 @@ def main() -> int:
     up_parser.add_argument("--factor", "-f", type=int, help="Upscale factor (default: model default)")
     up_parser.add_argument("--repeats", "-r", type=int, default=1, help="Upscale repeats")
     up_parser.add_argument("--threads", "-t", type=int, default=-1, help="Number of threads")
-    up_parser.add_argument("--offload-to-cpu", dest="offload_to_cpu", action="store_true", help="Offload to CPU")
     up_parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
 
     # -------------------------------------------------------------------------

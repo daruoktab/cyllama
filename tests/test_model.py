@@ -23,7 +23,7 @@ def test_model_load_with_progress_callback(model_path):
 
     cy.llama_backend_init()
     params = cy.LlamaModelParams()
-    params.use_mmap = False
+    params.load_mode = cy.LLAMA_LOAD_MODE_NONE  # no mmap: slower load, more progress ticks
     params.progress_callback = on_progress
     model = cy.LlamaModel(model_path, params)
     assert model
@@ -39,7 +39,7 @@ def test_model_load_cancel(model_path):
 
     cy.llama_backend_init()
     params = cy.LlamaModelParams()
-    params.use_mmap = False
+    params.load_mode = cy.LLAMA_LOAD_MODE_NONE  # no mmap: slower load, more progress ticks
     params.progress_callback = abort_at_50_percent
 
     # Loading should fail because we abort after 50%
@@ -61,12 +61,18 @@ def test_autorelease(model_path):
     assert model.n_ctx_train == 131072
     assert model.n_embd == 2048
     assert model.n_layer == 16
+    # Llama-3.2-1B has no multi-token-prediction (nextn) layers.
+    assert model.n_layer_nextn == 0
     assert model.n_head == 32
     assert model.n_head_kv == 8
     assert model.rope_freq_scale_train == 1.0
     assert model.desc == "llama 1B Q8_0"
     assert model.size == 1313251456
     assert model.n_params == 1235814432
+    # ftype: LLAMA_FTYPE_MOSTLY_Q8_0 == 7
+    assert model.ftype == 7
+    assert model.ftype_name == "Q8_0"
+    assert cy.ftype_name(model.ftype) == "Q8_0"
     assert model.has_decoder()
     assert model.decoder_start_token() == -1
     assert not model.has_encoder()
