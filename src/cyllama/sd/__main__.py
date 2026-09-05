@@ -103,30 +103,62 @@ def save_video_frames(frames: List["SDImage"], output_path: str, fps: int = 24) 
     print(f"Saved {len(frames)} frames to {base}_*.png")
 
 
+LOG_LEVEL_NAMES = {0: "DEBUG", 1: "INFO", 2: "WARN", 3: "ERROR"}
+
+# Rewind to column 0 and erase to end of line.
+_ERASE_LINE = "\r\033[K"
+
+# True while the last log text we emitted had no trailing newline, i.e. the
+# cursor sits inside a message of ours that must not be erased.
+_log_partial = False
+
+
+def emit_log(level: int, text: str) -> None:
+    """Print one native log line, stepping around the sampler's progress bar.
+
+    The sampler draws its bar straight from C with a bare ``\\r...\\033[K`` and
+    emits no newline until the final step (``print_progress_line`` in upstream
+    ``util.cpp``). That is a different stdout buffer from this one, so without
+    care a log line lands on top of the unterminated bar and the terminal
+    commits the result::
+
+        |====>     | 4/20 - 1.29s/it[DEBUG] ggml_extend.hpp:63 - ...
+
+    Erasing the line first drops the stale bar; the next progress callback
+    redraws it in full below the log line. Skipped when stdout is not a tty,
+    where the escape would be literal noise in a redirected log, and when a
+    previous fragment of this same message is still on the line.
+    """
+    global _log_partial
+    lead = "" if _log_partial or not sys.stdout.isatty() else _ERASE_LINE
+    print(f"{lead}[{LOG_LEVEL_NAMES.get(level, level)}] {text}", end="", flush=True)
+    _log_partial = not text.endswith("\n")
+
+
+def _log_warnings_only(level: int, text: str) -> None:
+    if level >= 2:
+        emit_log(level, text)
+
+
 def setup_logging(args: argparse.Namespace) -> None:
     """Setup logging and progress callbacks."""
     from .stable_diffusion import set_log_callback, set_progress_callback
 
-    if args.verbose:
-
-        def log_cb(level: int, text: str) -> None:
-            level_names = {0: "DEBUG", 1: "INFO", 2: "WARN", 3: "ERROR"}
-            print(f"[{level_names.get(level, level)}] {text}", end="")
-
-        set_log_callback(log_cb)
-    else:
-
-        def log_cb(level: int, text: str) -> None:
-            if level >= 2:
-                print(f"[{'WARN' if level == 2 else 'ERROR'}] {text}", end="")
-
-        set_log_callback(log_cb)
+    set_log_callback(emit_log if args.verbose else _log_warnings_only)
 
     if args.progress:
 
         def progress_cb(step: int, steps: int, time_ms: float) -> None:
+            # Same contract as the C bar: stay on one line, erase whatever the
+            # previous, longer update left behind, and close the line only once
+            # the run is done so the shell prompt starts clean.
             pct = (step / steps) * 100 if steps > 0 else 0
-            print(f"\rStep {step}/{steps} ({pct:.1f}%) - {time_ms:.2f}s", end="", flush=True)
+            done = steps > 0 and step >= steps
+            print(
+                f"\rStep {step}/{steps} ({pct:.1f}%) - {time_ms:.2f}s\033[K",
+                end="\n" if done else "",
+                flush=True,
+            )
 
         set_progress_callback(progress_cb)
 
@@ -212,13 +244,38 @@ def create_context_params(args: argparse.Namespace) -> "SDContextParams":
     #
     # Upstream replaced the old per-component CPU-placement flags
     # (offload_params_to_cpu / keep_clip_on_cpu / keep_vae_on_cpu /
-    # keep_control_net_on_cpu) with a single graph-cut segmented param offload
-    # controlled by `max_vram` ("0" = disabled, "-1" = auto). An explicit
-    # --max-vram wins; otherwise any legacy low-VRAM flag maps to auto offload.
+    # keep_control_net_on_cpu) with two independent mechanisms: `params_backend`,
+    # which pins a module's *weights* to a backend ("te=cpu"), and `max_vram`,
+    # a per-graph budget for graph-cut segmented offload ("0" = disabled,
+    # "-1" = auto). The legacy flags were placements, so they map to
+    # `params_backend` -- mapping them to `max_vram=-1` instead (as an earlier
+    # port did) silently changed their meaning and OOMs on small cards, because
+    # the auto budget is computed per module and does not account for weights
+    # another module already has resident.
     if hasattr(args, "max_vram") and args.max_vram is not None:
         params.max_vram = args.max_vram
-    elif any(getattr(args, name, False) for name in ("offload_to_cpu", "clip_on_cpu", "vae_on_cpu", "control_net_cpu")):
-        params.max_vram = "-1"
+    if getattr(args, "backend", None):
+        params.backend = args.backend
+
+    params_backend_spec = getattr(args, "params_backend", None)
+    if not params_backend_spec:
+        legacy_placements = []
+        if getattr(args, "offload_to_cpu", False):
+            # Upstream's spelling for "all modules on CPU" is a bare target.
+            legacy_placements.append("cpu")
+        else:
+            if getattr(args, "clip_on_cpu", False):
+                legacy_placements.append("te=cpu")
+            if getattr(args, "vae_on_cpu", False):
+                legacy_placements.append("vae=cpu")
+            if getattr(args, "control_net_cpu", False):
+                legacy_placements.append("control-net=cpu")
+        params_backend_spec = ",".join(legacy_placements)
+    if params_backend_spec:
+        params.params_backend = params_backend_spec
+
+    if getattr(args, "auto_fit", False):
+        params.auto_fit = True
     if hasattr(args, "eager_load") and args.eager_load:
         params.eager_load = True
     if hasattr(args, "diffusion_fa") and args.diffusion_fa:
@@ -717,12 +774,7 @@ def cmd_upscale(args: argparse.Namespace) -> int:
     from .stable_diffusion import Upscaler, SDImage, set_log_callback
 
     if args.verbose:
-
-        def log_cb(level: int, text: str) -> None:
-            level_names = {0: "DEBUG", 1: "INFO", 2: "WARN", 3: "ERROR"}
-            print(f"[{level_names.get(level, level)}] {text}", end="")
-
-        set_log_callback(log_cb)
+        set_log_callback(emit_log)
 
     print(f"Loading image: {args.input}")
     try:
@@ -769,12 +821,7 @@ def cmd_convert(args: argparse.Namespace) -> int:
     from .stable_diffusion import convert_model, SDType, set_log_callback
 
     if args.verbose:
-
-        def log_cb(level: int, text: str) -> None:
-            level_names = {0: "DEBUG", 1: "INFO", 2: "WARN", 3: "ERROR"}
-            print(f"[{level_names.get(level, level)}] {text}", end="")
-
-        set_log_callback(log_cb)
+        set_log_callback(emit_log)
 
     try:
         output_type = SDType[args.type.upper()]
@@ -930,19 +977,59 @@ def add_common_memory_args(parser: argparse.ArgumentParser) -> None:
         help='GiB budget or backend-assignment spec for graph-cut segmented param offload ("0" = disabled, "-1" = auto)',
     )
     parser.add_argument(
+        "--backend",
+        dest="backend",
+        default=None,
+        help='Compute-backend assignment: a device for every module ("cuda0") or per-module '
+        'assignments ("diffusion=cuda0,te=cpu"). Modules: diffusion, te, vae, clip-vision, '
+        "control-net, photomaker, upscaler, detector",
+    )
+    parser.add_argument(
+        "--params-backend",
+        dest="params_backend",
+        default=None,
+        help='Weight-residency assignment, same syntax as --backend plus "cpu"/"disk" targets '
+        '(e.g. "te=cpu,vae=cpu" keeps those weights in RAM while they still compute on the GPU)',
+    )
+    parser.add_argument(
+        "--auto-fit",
+        dest="auto_fit",
+        action="store_true",
+        help="Let stable-diffusion.cpp derive --backend/--params-backend from the models and the available VRAM",
+    )
+    parser.add_argument(
         "--eager-load",
         dest="eager_load",
         action="store_true",
         help="Load all params into the params backend at model-load time instead of lazily",
     )
-    # Legacy low-VRAM flags: upstream consolidated these into --max-vram; kept
-    # for compatibility, each maps to auto offload (--max-vram -1).
+    # Legacy low-VRAM flags: upstream replaced these with --params-backend
+    # placements, which is what they map to. They are placements, not budgets,
+    # so they must not be routed to --max-vram.
     parser.add_argument(
-        "--offload-to-cpu", dest="offload_to_cpu", action="store_true", help="Offload weights to CPU (low VRAM)"
+        "--offload-to-cpu",
+        dest="offload_to_cpu",
+        action="store_true",
+        help="Keep all weights on CPU (low VRAM); alias for --params-backend cpu",
     )
-    parser.add_argument("--clip-on-cpu", dest="clip_on_cpu", action="store_true", help="Keep CLIP on CPU")
-    parser.add_argument("--vae-on-cpu", dest="vae_on_cpu", action="store_true", help="Keep VAE on CPU")
-    parser.add_argument("--control-net-cpu", dest="control_net_cpu", action="store_true", help="Keep ControlNet on CPU")
+    parser.add_argument(
+        "--clip-on-cpu",
+        dest="clip_on_cpu",
+        action="store_true",
+        help="Keep the text encoder weights on CPU; alias for --params-backend te=cpu",
+    )
+    parser.add_argument(
+        "--vae-on-cpu",
+        dest="vae_on_cpu",
+        action="store_true",
+        help="Keep the VAE weights on CPU; alias for --params-backend vae=cpu",
+    )
+    parser.add_argument(
+        "--control-net-cpu",
+        dest="control_net_cpu",
+        action="store_true",
+        help="Keep the ControlNet weights on CPU; alias for --params-backend control-net=cpu",
+    )
     parser.add_argument(
         "--diffusion-fa", dest="diffusion_fa", action="store_true", help="Use flash attention in diffusion"
     )

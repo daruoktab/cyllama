@@ -16,7 +16,8 @@ import pytest
 
 import cyllama.llama.llama_cpp as cy
 
-ROOT = Path.cwd()
+# Anchored to this file, not the cwd: see the note in conftest.py.
+ROOT = Path(__file__).resolve().parent.parent
 RERANKER_MODEL = ROOT / "models" / "bge-reranker-base-q8_0.gguf"
 
 
@@ -84,21 +85,21 @@ class TestNewSamplers:
     def test_add_dry_with_breakers(self, model):
         vocab = model.get_vocab()
         with cy.LlamaSampler(cy.LlamaSamplerChainParams()) as s:
-            s.add_dry(vocab, model.n_ctx_train, 0.8, 1.75, 2, -1, ["\n", ":", '"', "*"])
+            s.add_dry(vocab, 0.8, 1.75, 2, 64, ["\n", ":", '"', "*"])
             assert len(s) == 1
 
     def test_add_dry_without_breakers(self, model):
         """seq_breakers is optional; None must not crash the char** marshalling."""
         vocab = model.get_vocab()
         with cy.LlamaSampler(cy.LlamaSamplerChainParams()) as s:
-            s.add_dry(vocab, model.n_ctx_train, 0.8, 1.75, 2, -1)
+            s.add_dry(vocab, 0.8, 1.75, 2, 64)
             assert len(s) == 1
 
     def test_add_dry_disabled_multiplier_still_builds(self, model):
         """multiplier 0.0 is the disabled value; upstream returns a no-op link."""
         vocab = model.get_vocab()
         with cy.LlamaSampler(cy.LlamaSamplerChainParams()) as s:
-            s.add_dry(vocab, model.n_ctx_train, 0.0, 1.75, 2, -1)
+            s.add_dry(vocab, 0.0, 1.75, 2, 64)
             assert len(s) == 1
 
     def test_add_grammar_lazy_patterns(self, model):

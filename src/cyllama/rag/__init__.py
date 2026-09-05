@@ -6,6 +6,8 @@ for embeddings and generation, with sqlite-vector for vector storage.
 Components:
     - Embedder: Generate text embeddings using llama.cpp embedding models
     - SqliteVectorStore (alias VectorStore): SQLite-based vector store using sqlite-vector
+    - Store adapters (cyllama.rag.stores): SqliteVecStore, ChromaVectorStore,
+      QdrantVectorStore, PgVectorStore -- alternative VectorStoreProtocol backends
     - TextSplitter: Split documents into chunks for embedding
     - Document Loaders: Load documents from various file formats
     - RAGPipeline: Orchestrate retrieval and generation
@@ -118,6 +120,9 @@ __all__ = [
     "VectorStoreError",
     "VectorStoreProtocol",
     "QdrantVectorStore",  # lazy-imported; requires qdrant-client
+    "SqliteVecStore",  # lazy-imported; requires sqlite-vec
+    "ChromaVectorStore",  # lazy-imported; requires chromadb
+    "PgVectorStore",  # lazy-imported; requires psycopg + pgvector
     # Text Splitters
     "TextSplitter",
     "TokenTextSplitter",
@@ -175,4 +180,16 @@ def __getattr__(name: str) -> object:
         from .stores.qdrant import QdrantVectorStore
 
         return QdrantVectorStore
+    if name == "SqliteVecStore":
+        from .stores.sqlite_vec import SqliteVecStore
+
+        return SqliteVecStore
+    if name == "ChromaVectorStore":
+        from .stores.chroma import ChromaVectorStore
+
+        return ChromaVectorStore
+    if name == "PgVectorStore":
+        from .stores.postgres import PgVectorStore
+
+        return PgVectorStore
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

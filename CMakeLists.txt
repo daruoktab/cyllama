@@ -110,13 +110,19 @@ if(DEFINED ENV{SD_USE_VENDORED_GGML})
     endif()
 endif()
 
-# stable-diffusion.cpp requires GGML_MAX_NAME=128 for long tensor names.
-# When SD shares llama.cpp's ggml, both must use the same value or the
-# ggml_tensor struct layout diverges. Must run *after* the SD_USE_VENDORED_GGML
-# env-var check above, or this define is skipped when the env var is the only
-# source of OFF.
+# stable-diffusion.cpp raises GGML_MAX_NAME for its long tensor names. When SD
+# shares llama.cpp's ggml, every translation unit that sees a ggml_tensor must
+# use the same value: `name` is an inline char[GGML_MAX_NAME] inside the struct,
+# so a mismatch moves `extra` (the field right after it, and the last one) past
+# the end of the real struct -- writes to it land on the following ggml_object
+# header and corrupt the arena, with no compile or link error to warn you.
+# Keep this in step with StableDiffusionCppBuilder.GGML_MAX_NAME in
+# scripts/manage.py, which propagates the same value to the llama.cpp build and
+# verifies it against upstream's CMakeLists.txt on every build.
+# Must run *after* the SD_USE_VENDORED_GGML env-var check above, or this define
+# is skipped when the env var is the only source of OFF.
 if(NOT SD_USE_VENDORED_GGML)
-    add_definitions(-DGGML_MAX_NAME=128)
+    add_definitions(-DGGML_MAX_NAME=160)
 endif()
 
 if(DEFINED ENV{LLAMACPP_DYLIB_DIR})
@@ -448,6 +454,10 @@ else()
     static_lib(LIB_GGML_BASE "${LLAMACPP_LIB}" "ggml-base")
     static_lib(LIB_GGML_CPU "${LLAMACPP_LIB}" "ggml-cpu")
     static_lib(LIB_MTMD "${LLAMACPP_LIB}" "mtmd")
+    # vendor/hash (sha256/sha1/xxhash), linked PRIVATE into mtmd upstream since
+    # llama.cpp v0.3.0 — mtmd-helper.cpp calls hash_sha256_hex(). It must follow
+    # LIB_MTMD in the link line for GNU ld to resolve that symbol.
+    static_lib(LIB_VENDOR_HASH "${LLAMACPP_LIB}" "vendor-hash")
 
     list(APPEND STATIC_LIBS
         "${LIB_LLAMA}"
@@ -455,6 +465,7 @@ else()
         "${LIB_GGML_BASE}"
         "${LIB_GGML_CPU}"
         "${LIB_MTMD}"
+        "${LIB_VENDOR_HASH}"
     )
 
     # cpp-httplib: intentionally NOT linked. cyllama does not link llama-common
@@ -689,7 +700,7 @@ function(add_cython_extension target_name pyx_file)
             list(APPEND _GGML_LIBS ${LIB_GGML_OPENCL})
         endif()
 
-        set(_OTHER_LIBS ${LIB_LLAMA} ${LIB_MTMD})
+        set(_OTHER_LIBS ${LIB_LLAMA} ${LIB_MTMD} ${LIB_VENDOR_HASH})
         if(WITH_WHISPER)
             list(APPEND _OTHER_LIBS ${LIB_WHISPER_COMMON} ${LIB_WHISPER})
         endif()
@@ -806,7 +817,7 @@ if(UNIX AND NOT APPLE)
     endif()
 
     # Note: SD libs are NOT included here - SD extension links its own ggml
-    set(_OTHER_LIBS ${LIB_LLAMA} ${LIB_MTMD})
+    set(_OTHER_LIBS ${LIB_LLAMA} ${LIB_MTMD} ${LIB_VENDOR_HASH})
     if(WITH_WHISPER)
         list(APPEND _OTHER_LIBS ${LIB_WHISPER_COMMON} ${LIB_WHISPER})
     endif()

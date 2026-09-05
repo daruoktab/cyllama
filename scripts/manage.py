@@ -140,15 +140,22 @@ PY_VER_MINOR = sys.version_info.minor
 STABLE_BUILD = getenv("STABLE_BUILD", True)
 if STABLE_BUILD:
     # known to build and work without errors, 100% tests pass
-    LLAMACPP_VERSION = "b10271"
+    LLAMACPP_VERSION = "v0.3.0"
     WHISPERCPP_VERSION = "v1.9.2"
-    SDCPP_VERSION = "master-812-ea7f0c8"
+    SDCPP_VERSION = "master-816-487de75"
     SQLITEVECTOR_VERSION = "1.0.0"
 else:
     # experimental bleeding-edge builds ` = ""` means get latest
-    LLAMACPP_VERSION = "b10271"
+    LLAMACPP_VERSION = "v0.3.0"
     WHISPERCPP_VERSION = "v1.9.2"
-    SDCPP_VERSION = "master-812-ea7f0c8"
+    # Ceiling, not staleness: `master-817-bcc7e29` ("support INT8 ConvRot
+    # safetensors") made stable-diffusion.cpp call `ggml_mul_mat_i8_tensorwise`
+    # and `ggml_quantize_i8_convrot`, which exist only in leejet's ggml fork.
+    # cyllama compiles SD against llama.cpp's ggml (see `_sync_ggml_abi`), where
+    # they are undeclared, so every SD translation unit fails to compile from 817
+    # on. `master-816-487de75` is the last commit that builds against upstream
+    # ggml; do not bump past it until those ops land in ggml proper.
+    SDCPP_VERSION = "master-816-487de75"
     SQLITEVECTOR_VERSION = "1.0.0"
 if PLATFORM == "Darwin":
     MACOSX_DEPLOYMENT_TARGET = setenv("MACOSX_DEPLOYMENT_TARGET", "12.6")
@@ -631,6 +638,11 @@ class AbstractBuilder(ShellCmd):
     repo_url: str
     download_url_template: str
     libs: list[str]
+    # Libs that exist only in the static form (upstream builds them as STATIC
+    # regardless of BUILD_SHARED_LIBS, and links them *into* the shared libs).
+    # Kept out of `libs` so the dynamic-build bookkeeping does not go looking
+    # for a dylib that is never produced.
+    static_only_libs: list[str] = []
     # Whether this builder produces a static/dynamic form at all. Most
     # builders do both; sqlite-vector, for example, is dynamic-only.
     produces_static: bool = True
@@ -893,7 +905,7 @@ class AbstractBuilder(ShellCmd):
         """Platform-resolved paths to the static-lib forms of `self.libs`."""
         if not self.produces_static:
             return []
-        return [self.static_lib_path(n) for n in self.libs]
+        return [self.static_lib_path(n) for n in self.libs + list(self.static_only_libs)]
 
     @property
     def dynamic_libs(self) -> list[Path]:
@@ -1203,6 +1215,13 @@ class LlamaCppBuilder(GgmlBuilder):
     # `llama-common` is deliberately absent: nothing in cyllama links it. See
     # the note above the target list in `build()`.
     extra_libs: list[str] = ["llama", "mtmd"]
+    # `vendor-hash` (vendor/hash: sha256/sha1/xxhash) is new in llama.cpp
+    # v0.3.0, where mtmd-helper.cpp started calling `hash_sha256_hex()`.
+    # Upstream links it PRIVATE into mtmd, so a static libmtmd.a leaves the
+    # symbol undefined and the Cython extension fails to load with
+    # `undefined symbol: _Z15hash_sha256_hex...`. Static-only: upstream always
+    # builds it STATIC, and the shared libmtmd already absorbs it.
+    static_only_libs: list[str] = ["vendor-hash"]
 
     def get_backend_cmake_options(self) -> dict[str, Any]:
         """CMake options for llama.cpp (GGML_* flag names)."""
@@ -1296,8 +1315,8 @@ class LlamaCppBuilder(GgmlBuilder):
         backend_options = self.get_backend_cmake_options()
 
         # When SD shares llama.cpp's ggml dylibs, the ggml_tensor struct
-        # layout must match.  SD requires GGML_MAX_NAME=128; propagate it
-        # to the llama.cpp build so both sides agree.
+        # layout must match.  Propagate SD's GGML_MAX_NAME to the llama.cpp
+        # build so both sides agree.
         extra = {}
         if StableDiffusionCppBuilder.uses_shared_ggml():
             _def = f"-DGGML_MAX_NAME={StableDiffusionCppBuilder.GGML_MAX_NAME}"
@@ -1343,9 +1362,23 @@ class LlamaCppBuilder(GgmlBuilder):
         self.copy_lib(self.build_dir, "ggml/src", "ggml-base", self.lib)
         self.copy_lib(self.build_dir, "ggml/src", "ggml-cpu", self.lib)
         self.copy_lib(self.build_dir, "tools/mtmd", "mtmd", self.lib)
+        # Static-only dependency of mtmd; see `static_only_libs` above.
+        self.copy_lib(self.build_dir, "vendor/hash", "vendor-hash", self.lib, required=False)
 
         # Copy backend-specific libraries
         self.copy_backend_libs()
+
+    @staticmethod
+    def _use_backend_dl() -> bool:
+        """Whether ggml backends may be built as dlopen-able plugins.
+
+        Under `GGML_BACKEND_DL=ON` they are CMake MODULE libraries, which Apple
+        emits as MH_BUNDLE; `ld` takes only MH_OBJECT and MH_DYLIB as input, and
+        cyllama's CMakeLists links the backend dylibs directly rather than
+        loading them at runtime. Darwin therefore has to build them SHARED,
+        which rules out BACKEND_DL there whatever the arch or backend.
+        """
+        return PLATFORM != "Darwin"
 
     def build_shared(self) -> None:
         """Build from source with BUILD_SHARED_LIBS=ON and copy to dynamic/.
@@ -1376,20 +1409,11 @@ class LlamaCppBuilder(GgmlBuilder):
             extra["CMAKE_C_FLAGS"] = _def
             extra["CMAKE_CXX_FLAGS"] = _def
 
-        # macOS x86_64 + Vulkan: with GGML_BACKEND_DL=ON, ggml backends are
-        # built as CMake MODULE libs (MH_BUNDLE on Apple) which cannot be
-        # linked against at build time — the downstream cyllama extensions
-        # link the backend dylibs directly, so we need MH_DYLIB output.
-        # Disable BACKEND_DL on this path to get proper SHARED dylibs.
-        use_backend_dl = True
-        if PLATFORM == "Darwin" and ARCH == "x86_64" and backend_options.get("GGML_VULKAN") == "ON":
-            use_backend_dl = False
-
         self.cmake_config(
             src_dir=self.src_dir,
             build_dir=self.build_dir,
             BUILD_SHARED_LIBS=True,
-            GGML_BACKEND_DL=use_backend_dl,
+            GGML_BACKEND_DL=self._use_backend_dl(),
             CMAKE_POSITION_INDEPENDENT_CODE=True,
             LLAMA_CURL=False,
             LLAMA_OPENSSL=False,  # cpp-httplib is not linked into cyllama (see CMakeLists.txt), so no SSL needed
@@ -1407,9 +1431,9 @@ class LlamaCppBuilder(GgmlBuilder):
         self.cmake_build_targets(build_dir=self.build_dir, targets=targets, release=True)
 
         # Collect all shared libs from the build tree into dynamic/.
-        # On Darwin, SHARED_LIB_GLOBS includes "**/*.so" to pick up CMake
-        # MODULE libs (ggml backend plugins under GGML_BACKEND_DL=ON) which
-        # get renamed to .dylib below so CMakeLists' dylib glob finds them.
+        # Darwin's "**/*.so" glob and the .dylib rename below only matter for a
+        # tree built with GGML_BACKEND_DL=ON; `_use_backend_dl()` never asks for
+        # one there. Kept so the collection step stays correct if that changes.
         self.dynamic_lib.mkdir(parents=True, exist_ok=True)
         patterns = SHARED_LIB_GLOBS
 
@@ -1821,6 +1845,21 @@ class WhisperCppBuilder(GgmlBuilder):
         # Get backend options
         backend_options = self.get_backend_cmake_options()
 
+        # whisper.cpp builds its own ggml, but nothing links it: cyllama's
+        # CMakeLists takes every ggml lib from ${LLAMACPP_LIB}, so `libwhisper.a`
+        # and `libcommon.a` end up calling llama.cpp's ggml. That makes this the
+        # third tree that has to agree on GGML_MAX_NAME -- see the note on
+        # StableDiffusionCppBuilder.GGML_MAX_NAME for what a mismatch does to
+        # `struct ggml_tensor`. Whisper has been getting away with the default
+        # (64 against llama.cpp's 160) only because it never touches `extra`,
+        # the one field that moves; that is luck, not design, and it would turn
+        # into silent corruption the first time upstream reaches for it.
+        extra = {}
+        if StableDiffusionCppBuilder.uses_shared_ggml():
+            _def = f"-DGGML_MAX_NAME={StableDiffusionCppBuilder.GGML_MAX_NAME}"
+            extra["CMAKE_C_FLAGS"] = _def
+            extra["CMAKE_CXX_FLAGS"] = _def
+
         self.cmake_config(
             src_dir=self.src_dir,
             build_dir=self.build_dir,
@@ -1830,6 +1869,7 @@ class WhisperCppBuilder(GgmlBuilder):
             CMAKE_C_VISIBILITY_PRESET="hidden",
             CMAKE_VISIBILITY_INLINES_HIDDEN=True,
             CMAKE_INSTALL_LIBDIR="lib",  # Prevent lib64 on 64-bit Linux
+            **extra,
             **backend_options,
         )
         self.cmake_build(build_dir=self.build_dir, release=True)
@@ -1849,11 +1889,61 @@ class StableDiffusionCppBuilder(GgmlBuilder):
     base_libs: list[str] = ["stable-diffusion"]
     extra_libs: list[str] = []
 
-    # stable-diffusion.cpp requires GGML_MAX_NAME=128 (see its CMakeLists.txt:233
-    # and ggml_extend.hpp:94). llama.cpp defaults to 64. When SD shares
-    # llama.cpp's ggml (the default), both sides must agree on this value or the
-    # ggml_tensor struct layout diverges and tensor copies crash.
-    GGML_MAX_NAME: int = 128
+    # stable-diffusion.cpp raises GGML_MAX_NAME (`add_definitions()` near the top
+    # of its CMakeLists.txt) because its tensor names are long. llama.cpp
+    # defaults to 64. When SD shares llama.cpp's ggml -- the default, and what
+    # ships -- both sides must be compiled with the *same* value: `name` is an
+    # inline `char[GGML_MAX_NAME]` in `struct ggml_tensor`, so a mismatch moves
+    # every field after it. `extra` is the field right after `name`, and it is
+    # the last one, so SD writing `tensor->extra` lands past the end of the real
+    # struct -- on top of the following `ggml_object` header in the context
+    # arena. The graph-cut segmented path writes it on every segment boundary
+    # (`reset_segment_runtime_tensors`), which truncates the compute context's
+    # object list mid-run; with the params backend on the CPU it corrupts the
+    # malloc arena instead and glibc aborts with "corrupted double-linked list".
+    # Nothing warns: the headers are identical, only the -D differs.
+    #
+    # `_verify_ggml_max_name()` re-reads the value out of the cloned tree on
+    # every build, because this pin silently went stale once already: it sat at
+    # 128 while upstream had moved to 160.
+    GGML_MAX_NAME: int = 160
+
+    def _verify_ggml_max_name(self) -> None:
+        """Abort the build if upstream's GGML_MAX_NAME no longer matches the pin.
+
+        llama.cpp's ggml is configured with `GGML_MAX_NAME` *before* SD is even
+        cloned, so the value cannot simply be read from the source at that
+        point -- it has to be pinned. This check closes the loop from the other
+        side: once SD's tree is on disk, confirm the pin still describes it.
+        The failure mode it guards against is silent memory corruption, not a
+        compile error, so it fails the build rather than warning.
+        """
+        if not self.uses_shared_ggml():
+            return
+        cmakelists = self.src_dir / "CMakeLists.txt"
+        if not cmakelists.exists():
+            return
+        match = re.search(r"add_definitions\(\s*-DGGML_MAX_NAME=(\d+)\s*\)", cmakelists.read_text())
+        if match is None:
+            self.log.warning(
+                "%s: no GGML_MAX_NAME definition found in CMakeLists.txt; "
+                "assuming the pinned %d still matches llama.cpp's ggml",
+                self.name,
+                self.GGML_MAX_NAME,
+            )
+            return
+        upstream = int(match.group(1))
+        if upstream != self.GGML_MAX_NAME:
+            raise RuntimeError(
+                f"{self.name} {self.version} sets GGML_MAX_NAME={upstream}, but llama.cpp's ggml "
+                f"was built with {self.GGML_MAX_NAME}. Sharing one ggml across both requires the "
+                f"same value: it sizes `name` inside `struct ggml_tensor`, so a mismatch shifts "
+                f"`extra` and SD's writes to it land on the next ggml_object header (silent heap "
+                f"corruption, not a link error). Set "
+                f"StableDiffusionCppBuilder.GGML_MAX_NAME = {upstream} in scripts/manage.py and "
+                f"the matching add_definitions() in cyllama's own CMakeLists.txt, then rebuild "
+                f"llama.cpp so its ggml picks up the new value."
+            )
 
     @staticmethod
     def uses_shared_ggml() -> bool:
@@ -1902,19 +1992,30 @@ class StableDiffusionCppBuilder(GgmlBuilder):
 
         We replace SD's vendored ggml directory with llama.cpp's ggml so that
         headers, source, and the runtime dylibs all use the same version.
+
+        The swap also invalidates SD's cmake tree, which is dropped with it:
+        `copytree` preserves mtimes, so the incoming sources are not newer than
+        the objects already built from the tree being replaced. One surviving
+        `ggml-metal-device.m.o` from before llama.cpp split its Metal library
+        per op-source resolves `_ggml_metallib_start` against a tree that only
+        defines `_ggml_metallib_<name>_start`.
         """
         import shutil
 
         llama_ggml = self.project.src / "llama.cpp" / "ggml"
         sd_ggml = self.src_dir / "ggml"
         if not llama_ggml.exists() or not sd_ggml.exists():
-            self.log.warn("Cannot sync ggml ABI: llama.cpp or SD ggml dir missing")
+            self.log.warning("Cannot sync ggml ABI: llama.cpp or SD ggml dir missing")
             return
 
         # Replace SD's vendored ggml with llama.cpp's copy
         shutil.rmtree(sd_ggml)
         shutil.copytree(llama_ggml, sd_ggml)
         self.log.info("Replaced SD's vendored ggml with llama.cpp's ggml for ABI compatibility")
+
+        if self.build_dir.exists():
+            self.remove(self.build_dir)
+            self.log.info("Dropped %s: its objects were compiled against the replaced ggml", self.build_dir)
 
     def build(self, shared: bool = False, examples: bool = True) -> None:
         """stable-diffusion.cpp main build function"""
@@ -1927,6 +2028,7 @@ class StableDiffusionCppBuilder(GgmlBuilder):
         # compiles and links its own vendored copy and syncing would overwrite
         # that source.
         if self.uses_shared_ggml():
+            self._verify_ggml_max_name()
             self._sync_ggml_abi()
 
         # after _sync_ggml_abi(), so the ggml patches land on whichever ggml
@@ -2131,6 +2233,25 @@ _WIN_INCLUDES: dict[str, list[str]] = {
 _WIN_EXCLUDES: dict[str, list[str]] = {
     "cuda": ["nvcuda.dll", "cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll"],
 }
+# delvewheel mangles bundled non-system DLLs to hash-suffixed names and rewrites
+# the import tables of everything in the dependency graph to match. Backend
+# plugins arrive via --include and are NOT in that graph -- nothing in the wheel
+# imports them, that is why --include is needed -- so their own import tables are
+# never rewritten and they keep importing the pre-mangling names. Pin the project
+# libs to their real names so an --include'd plugin can resolve them.
+#
+# Applied unconditionally, not per-backend: the CPU wheel static-links ggml into
+# the extensions and bundles none of these, so the flag is a no-op there, while
+# one shared list means a future --include'd plugin cannot reintroduce the bug.
+# Confirmed broken in the published 0.4.2 cuda12 and vulkan Windows wheels; see
+# windows-dll-mangling.md.
+_WIN_NO_MANGLE: list[str] = [
+    "ggml.dll",
+    "ggml-base.dll",
+    "ggml-cpu.dll",
+    "llama.dll",
+    "mtmd.dll",
+]
 
 # GPU backends share a manylinux platform override -- their SDK libs
 # (CUDA/Vulkan/ROCm/oneAPI) reference glibc symbols newer than
@@ -2364,6 +2485,8 @@ def _run_wheel_repair(
                 cmd += ["--include", inc]
             for exc in _WIN_EXCLUDES.get(backend, []):
                 cmd += ["--no-dll", exc]
+            if _WIN_NO_MANGLE:
+                cmd += ["--no-mangle", ";".join(_WIN_NO_MANGLE)]
             cmd.append(str(whl))
             log.info(" ".join(cmd))
             subprocess.check_call(cmd)
@@ -2877,7 +3000,7 @@ class Application(ShellCmd, metaclass=MetaCommander):
                 assert isinstance(builder, LlamaCppBuilder)
                 asset = builder._release_asset_name()
                 # When SD shares llama.cpp's ggml, the shared libs must be
-                # built with GGML_MAX_NAME=128 so ggml_tensor's layout matches
+                # built with SD's GGML_MAX_NAME so ggml_tensor's layout matches
                 # what SD was compiled with. Upstream pre-built releases use
                 # the default GGML_MAX_NAME=64, so skip them and build from
                 # source to propagate the define.
@@ -2885,7 +3008,8 @@ class Application(ShellCmd, metaclass=MetaCommander):
                     if asset is not None:
                         self.log.info(
                             "SD shares llama.cpp's ggml: building llama.cpp "
-                            "from source to propagate GGML_MAX_NAME=128 "
+                            "from source to propagate GGML_MAX_NAME="
+                            f"{StableDiffusionCppBuilder.GGML_MAX_NAME} "
                             "(skipping upstream pre-built release)"
                         )
                     else:
@@ -3175,7 +3299,10 @@ class Application(ShellCmd, metaclass=MetaCommander):
 
         # Step 3: bundle shared-library deps into the wheel (dynamic only).
         if args.dynamic:
-            self.do_wheel_repair(argparse.Namespace(backend=args.backend, wheel=None, dest_dir=None))
+            # archs must be present: do_wheel_repair reads it unconditionally.
+            # It is macOS-only (delocate --require-archs) and None means "don't
+            # pass the flag", which is what a local build wants on any platform.
+            self.do_wheel_repair(argparse.Namespace(backend=args.backend, wheel=None, dest_dir=None, archs=None))
 
     # ------------------------------------------------------------------------
     # wheel

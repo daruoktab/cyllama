@@ -32,6 +32,10 @@ docs/book/_book/
 # project detritus
 .*_cache
 output.wav
+# rwt.py writes its renders into the project root
+output.png
+z_turbo_*.png
+vector.db
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -161,6 +165,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-*/
 env/
 venv/
 ENV/
